@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# agent-job-semaphore: lets many AI-agent sessions on one machine share a few heavy-job slots,
+# with one FIFO queue and a load and memory gate per slot.
+# SPDX-License-Identifier: Apache-2.0
+set -u
+AJS_VERSION=0.1.0
+
+usage() {
+  cat <<'EOF'
+usage: agent-job-semaphore [options] -- <command> [args...]
+
+Runs <command> once it holds one of AJS_SLOTS slots shared by every session of this user on this machine.
+Waiters line up in a single FIFO queue. A slot starts its command only when load1 is below the per-slot
+budget times the slots already running plus one, after any earlier ticket still waiting at its own gate,
+and, while another slot is busy, when there is memory for one more job. The raw output goes to a file and
+ONE summary line is printed:
+  ajs <dir> rc=<n> <start>-><end> load1 <before>-><after> <test summary> (output: <file>)
+
+options:
+  -n, --name <name>       ticket name; one live ticket per name (default: $AJS_NAME, else $USER)
+  -C, --dir <dir>         run the command in <dir> (default: the current directory)
+  -t, --timeout <s>       longest wait at the load and memory gate, counted from when the slot
+                          reaches it (default 1800); the queue itself never times out
+  -l, --load-max <n>      load1 budget per slot (default: $AJS_LOAD_MAX, else nproc/3, at least 1)
+  -o, --out <dir>         raw output directory (default: $AJS_OUT, else
+                          ${XDG_STATE_HOME:-~/.local/state}/agent-job-semaphore/<name>)
+  -a, --append-to <file>  also append the summary line, with date and name, to <file>
+  -h, --help              this help
+  -V, --version           print the version
+
+exit codes:
+  <n>      the command's own exit code
+  2        usage: no command, unknown option, bad value, or a name outside [A-Za-z0-9][A-Za-z0-9._-]*
+  73       a live ticket with the same name is already queued; nothing is queued or run
+  75       the load or memory gate did not open within --timeout
+  78       configuration: the lock directory is not usable, or an AJS_* value is out of range
+  130/143  SIGINT/SIGTERM while queued or running: the command gets SIGTERM and the slot is freed
+
+liveness: every process touches its ticket every AJS_BEAT seconds, and the owner file of the slot it holds.
+  A ticket silent for more than AJS_STALE seconds belongs to a dead process and waiters remove it; a slot
+  whose owner is silent that long and whose ticket left the queue is removed by the first in line. A live
+  process whose ticket was removed puts it back in its place. Each removal is logged to <AJS_DIR>/events.log.
+
+environment (all optional):
+  AJS_DIR             lock directory shared by all sessions (default ${XDG_RUNTIME_DIR:-/run/user/<uid>}/agent-job-semaphore)
+  AJS_SLOTS           slots, 1 to 16 (2); every session should use the same value
+  AJS_NAME, AJS_LOAD_MAX, AJS_OUT   defaults for --name, --load-max and --out
+  AJS_BEAT (10), AJS_STALE (90, more than twice AJS_BEAT), AJS_POLL (5), AJS_GATE_POLL (6 x AJS_POLL),
+  AJS_NOTICE_AFTER (300): seconds
+  AJS_MEM_MIN_MIB (4096): MemAvailable needed for one more slot while another is busy
+  AJS_MEM_ROOMY_MIB (8192): below this MemAvailable, SwapFree must also exceed the swap reserve
+  AJS_SWAP_RESERVE_MIB (2048): the reserve is the smaller of this and SwapTotal/4
+  AJS_PSI_MAX (10): "some avg10" of /proc/pressure/memory must stay below it (ignored if unreadable)
+  AJS_JEST_WORKERS (2): --maxWorkers added to a jest or vitest command that has none; 0 disables
+  AJS_SUMMARY_REGEX ('^[[:space:]]*Tests:?[[:space:]]'): the last matching line of the output's
+                      last 2000 lines becomes the test summary
+  AJS_LOADAVG_FILE, AJS_MEMINFO_FILE, AJS_PSI_FILE: read instead of /proc (tests, containers)
+EOF
+}
+
+die() { local rc=$1; shift; printf 'agent-job-semaphore: %s\n' "$*" >&2; exit "$rc"; }
+is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
+# Decimal string to hundredths, so load1 compares in pure bash: "6", "6.5" and "6.00" all parse.
+centi() {
+  [[ $1 =~ ^([0-9]+)(\.([0-9]*))?$ ]] || return 1
+  local f=${BASH_REMATCH[3]}00
+  printf '%s\n' $((10#${BASH_REMATCH[1]} * 100 + 10#${f:0:2}))
+}
+show_centi() { if (($1 % 100)); then printf '%d.%02d' $(($1 / 100)) $(($1 % 100)); else printf '%d' $(($1 / 100)); fi; }
+
+name=${AJS_NAME:-${USER:-agent}}; workdir=.; append=""; timeout=1800; out=${AJS_OUT:-}
+loadmax=${AJS_LOAD_MAX:-}; loadmax_from=AJS_LOAD_MAX
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) printf 'agent-job-semaphore %s\n' "$AJS_VERSION"; exit 0 ;;
+    -n|--name|-C|--dir|-t|--timeout|-l|--load-max|-o|--out|-a|--append-to)
+      [ $# -ge 2 ] || die 2 "option $1 needs a value"
+      case $1 in
+        -n|--name) name=$2 ;;
+        -C|--dir) workdir=$2 ;;
+        -t|--timeout) timeout=$2 ;;
+        -l|--load-max) loadmax=$2; loadmax_from=--load-max ;;
+        -o|--out) out=$2 ;;
+        -a|--append-to) append=$2 ;;
+      esac
+      shift 2 ;;
+    --) shift; break ;;
+    *) usage >&2; die 2 "unknown argument '$1' (the command goes after --)" ;;
+  esac
+done
+[ $# -gt 0 ] || { usage >&2; exit 2; }
+[[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 2 "name '$name' is not [A-Za-z0-9][A-Za-z0-9._-]*"
+[ -d "$workdir" ] || die 2 "--dir '$workdir' is not a directory"
+is_uint "$timeout" || die 2 "--timeout '$timeout' is not a whole number of seconds"
+if [ -z "$loadmax" ]; then
+  loadmax=$(( $(nproc 2>/dev/null || echo 3) / 3 )); [ "$loadmax" -ge 1 ] || loadmax=1
+fi
+loadmax_c=$(centi "$loadmax") && [ "$loadmax_c" -gt 0 ] || {
+  [ "$loadmax_from" = --load-max ] && die 2 "--load-max '$loadmax' is not a positive number"
+  die 78 "AJS_LOAD_MAX='$loadmax' is not a positive number"
+}
+
+# Every AJS_* number is checked before anything is written: a bad value never half-runs.
+env_uint() {  # env_uint <var> <default> <min> [max]
+  local v=${!1:-$2}
+  is_uint "$v" && [ "$((10#$v))" -ge "$3" ] && { [ -z "${4:-}" ] || [ "$((10#$v))" -le "$4" ]; } ||
+    die 78 "$1='$v' is out of range (min $3${4:+, max $4})"
+  printf '%s\n' $((10#$v))
+}
+nslots=$(env_uint AJS_SLOTS 2 1 16) || exit 78
+beat=$(env_uint AJS_BEAT 10 1) || exit 78
+stale=$(env_uint AJS_STALE 90 1) || exit 78
+[ "$stale" -gt $((beat * 2)) ] || die 78 "AJS_STALE=$stale must be more than twice AJS_BEAT=$beat"
+poll=$(env_uint AJS_POLL 5 1) || exit 78
+gate_poll=$(env_uint AJS_GATE_POLL $((poll * 6)) 1) || exit 78
+notice_after=$(env_uint AJS_NOTICE_AFTER 300 1) || exit 78
+v=$(env_uint AJS_MEM_MIN_MIB 4096 0) || exit 78; mem_min_kib=$((v * 1024))
+v=$(env_uint AJS_MEM_ROOMY_MIB 8192 0) || exit 78; mem_roomy_kib=$((v * 1024))
+v=$(env_uint AJS_SWAP_RESERVE_MIB 2048 0) || exit 78; swap_cap_kib=$((v * 1024))
+psi_max=$(env_uint AJS_PSI_MAX 10 0) || exit 78
+jest_workers=$(env_uint AJS_JEST_WORKERS 2 0) || exit 78
+summary_re=${AJS_SUMMARY_REGEX:-'^[[:space:]]*Tests:?[[:space:]]'}
+loadavg=${AJS_LOADAVG_FILE:-/proc/loadavg}
+meminfo=${AJS_MEMINFO_FILE:-/proc/meminfo}
+pressure=${AJS_PSI_FILE:-/proc/pressure/memory}
+
+# Glob order and [[ < ]] follow the locale; tickets must sort bytewise. The command gets the caller's LC_ALL back.
+if [ "${LC_ALL+set}" = set ]; then caller_lc_all=$LC_ALL; caller_lc_set=1; else caller_lc_all=; caller_lc_set=0; fi
+LC_ALL=C
+
+uid=$(id -u)
+dir=${AJS_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/agent-job-semaphore}
+queue=$dir/queue
+wlog=$dir/events.log
+refuse() { die 78 "lock directory '$dir' is not usable ($1). Point AJS_DIR at a directory every session can write: a sandbox with a private /tmp cannot share a queue."; }
+[ ! -e "$dir" ] || [ -d "$dir" ] || refuse "it is not a directory"
+mkdir -p -m 700 "$dir" 2>/dev/null || refuse "cannot create it"
+probe=$dir/.probe-$(date +%s%N)-$$
+mkdir "$probe" 2>/dev/null && rmdir "$probe" 2>/dev/null || refuse "cannot write in it"
+[ ! -e "$queue" ] || [ -d "$queue" ] || refuse "queue is not a directory"
+mkdir -p "$queue" 2>/dev/null || refuse "cannot create the queue"
+probe=$queue/.probe-$(date +%s%N)-$$
+mkdir "$probe" 2>/dev/null && rmdir "$probe" 2>/dev/null || refuse "cannot write in the queue"
+slots=(); for ((k = 1; k <= nslots; k++)); do slots+=("$dir/slot.$k"); done
+
+if [ -z "$out" ]; then
+  if [ -n "${XDG_STATE_HOME:-}" ] || [ -n "${HOME:-}" ]; then
+    out=${XDG_STATE_HOME:-$HOME/.local/state}/agent-job-semaphore/$name
+  else
+    out=${TMPDIR:-/tmp}
+    printf 'agent-job-semaphore: neither XDG_STATE_HOME nor HOME is set; raw output goes to %s. Pass --out <dir> to keep it elsewhere.\n' "$out" >&2
+  fi
+fi
+mkdir -p "$out" 2>/dev/null || die 2 "cannot write raw output to '$out'"
+
+tb=""; ticket=""; held=0; child=0; hb=0; slot=""
+note() { printf '%s agent-job-semaphore: %s %s\n' "$(date '+%F %T')" "$name" "$1" >> "$wlog" 2>/dev/null; printf 'agent-job-semaphore: %s\n' "$1" >&2; }
+slot_label() { printf 'slot %s' "${1##*/slot.}"; }
+owns() { local o=; { read -r o < "$1/owner"; } 2>/dev/null; [[ $o == *" ticket=$tb" ]]; }
+# PID namespaces hide processes from each other (kill -0 fails across sandboxes); a refreshed mtime is the
+# liveness signal that crosses them: the ticket always, and the owner file of the slot this process holds.
+beat_on() {
+  ( while kill -0 $$ 2>/dev/null; do
+      touch -c "$ticket"; for s in "${slots[@]}"; do owns "$s" && touch -c "$s/owner"; done; sleep "$beat"
+    done ) </dev/null >/dev/null 2>&1 &
+  hb=$!
+}
+beat_off() { [ "$hb" -gt 0 ] && { kill "$hb" 2>/dev/null; wait "$hb" 2>/dev/null; hb=0; }; }
+enqueue() { tb=$(date +%s%N)-$$-$name; ticket=$queue/$tb; : > "$ticket" 2>/dev/null || refuse "cannot write a ticket"; beat_on; }
+# Only this process's own slot is removed: if it was reaped for silence it is gone or someone else's, and that is said.
+mine() { [ -d "$slot" ] && { [ ! -e "$slot/owner" ] || owns "$slot"; }; }
+release() {
+  beat_off
+  if [ "$held" -eq 1 ]; then
+    if mine; then rm -rf "$slot"; else
+      local o=; { read -r o < "$slot/owner"; } 2>/dev/null
+      note "lost $(slot_label "$slot") while running: two jobs may have overlapped (owner now: ${o:-none})"
+    fi
+  fi
+  [ -z "$ticket" ] || rm -f "$ticket"
+}
+# bash defers a trap until a foreground child ends, so the command runs in the background and is awaited;
+# a background child starts with SIGINT ignored, so INT is forwarded as TERM.
+abort() { [ "$child" -gt 0 ] && kill -s TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; release; trap - EXIT; [ "$1" = INT ] && exit 130 || exit 143; }
+trap 'abort INT' INT
+trap 'abort TERM' TERM
+trap release EXIT
+# The heartbeat starts with the ticket: a newcomer slow on its first pass does not look dead.
+enqueue
+
+load1() { local l=; { read -r l _ < "$loadavg"; } 2>/dev/null; printf '%s\n' "${l:-?}"; }
+# The queue is the tickets in name order (epoch in ns). A ticket may take a free slot when every ticket ahead
+# of it already holds one; every slot directory counts, so a session with fewer AJS_SLOTS still sees them all.
+read_holders() {
+  local s o; holders=' '
+  for s in "$dir"/slot.*; do o=; { read -r o < "$s/owner"; } 2>/dev/null; [ "${o##* ticket=}" = "$o" ] || holders+="${o##* ticket=} "; done
+}
+in_turn() {
+  local t; read_holders
+  for t in "$queue"/*; do
+    [ "$t" = "$ticket" ] && return 0
+    [[ $holders == *" ${t##*/} "* ]] || return 1
+  done
+  return 1
+}
+holder() {  # each busy slot with its owner line
+  local s o res=
+  for s in "$dir"/slot.*; do [ -d "$s" ] || continue; o=; { read -r o < "$s/owner"; } 2>/dev/null; res+="${res:+; }${s##*/}: ${o:-?}"; done
+  printf '%s\n' "${res:-?}"
+}
+escape() {  # the rm that frees each busy slot and its ticket, if its owner is really dead
+  local s o t res=
+  for s in "$dir"/slot.*; do
+    [ -d "$s" ] || continue; o=; { read -r o < "$s/owner"; } 2>/dev/null; t=${o##* ticket=}
+    [ -n "$o" ] && [ "$t" != "$o" ] && [ -e "$queue/$t" ] || t='<owner-ticket>'
+    res+="${res:+ }'$s' '$queue/$t'"
+  done
+  printf '%s\n' "$res"
+}
+queue_names() { local t res=; for t in "$queue"/*; do [ -e "$t" ] && res+="${t##*/} "; done; printf '%s\n' "$res"; }
+
+age() { local now; printf -v now '%(%s)T' -1; echo $((now - $(stat -c %Y -- "$1" 2>/dev/null || echo 0))); }
+# One stat per pass whatever the queue length. The mv to a hidden name is atomic: of several waiters that
+# see the same dead ticket, only one removes and logs it.
+reap_tickets() {
+  local now m t
+  printf -v now '%(%s)T' -1
+  while read -r m t; do
+    [ "$t" != "$ticket" ] && [ $((now - m)) -gt "$stale" ] || continue
+    mv -- "$t" "$queue/.reaped-$tb" 2>/dev/null || continue
+    rm -f "$queue/.reaped-$tb"; note "reaps dead ticket ${t##*/} (no heartbeat for $((now - m))s > ${stale}s)"
+  done < <(stat -c '%Y %n' -- "$queue"/* 2>/dev/null)
+}
+# Only a ticket whose turn it is gets here. A slot is reaped when its owner file (or the dir, if its owner died
+# before writing it) is older than AJS_STALE and the owner's ticket has left the queue.
+fresh_slot() { local f=$1/owner; [ -e "$f" ] || f=$1; [ -e "$f" ] && [ "$(age "$f")" -le "$stale" ]; }
+reap_slot() {
+  local s=$1 o t moved
+  moved=$dir/.reaped-${s##*/}-$tb
+  o=; { read -r o < "$s/owner"; } 2>/dev/null; t=${o##* ticket=}
+  [ -z "$o" ] || [ -z "$t" ] || [ ! -e "$queue/$t" ] || return 1
+  [ -d "$s" ] && ! fresh_slot "$s" || return 1
+  [ -e "$ticket" ] || return 1   # reaped as dead while asleep: this process no longer has the turn
+  mv -T -- "$s" "$moved" 2>/dev/null || return 1
+  # Another process may have taken the slot between the read and the mv: a live one is given back.
+  o=; { read -r o < "$moved/owner"; } 2>/dev/null
+  if fresh_slot "$moved"; then mv -T -- "$moved" "$s" 2>/dev/null; note "gives back live $(slot_label "$s") (${o:-no owner})"; return 1; fi
+  rm -rf "$moved"; note "reaps orphaned $(slot_label "$s") (${o:-no owner})"
+}
+
+# One ticket per name: if an older live ticket has this name, leave without waiting. Comparing only against
+# older tickets lets exactly one through when several arrive in the same instant.
+reap_tickets
+for t in "$queue"/*; do
+  b=${t##*/}
+  [[ $b =~ ^[0-9]+-[0-9]+-(.*)$ && ${BASH_REMATCH[1]} == "$name" && $b < $tb ]] || continue
+  printf "agent-job-semaphore: a live ticket named '%s' is already queued: %s; not queueing another (rc 73). Wait for it or use another --name.\n" "$name" "$b" >&2
+  exit 73
+done
+
+# The queue has no time limit: a ticket with a heartbeat waits its turn; a silent one is reaped when stale.
+start=$SECONDS; waited=0; told=0
+while :; do
+  if in_turn; then
+    for s in "${slots[@]}"; do
+      if [ ! -e "$s" ] && mkdir "$s" 2>/dev/null; then slot=$s; held=1; break; fi
+      [ ! -e "$s" ] || [ -d "$s" ] || refuse "${s##*/} is not a directory"
+    done
+    # The gate mark goes before the owner: whoever reads the owner already sees this slot is not running yet.
+    if [ "$held" -eq 1 ]; then
+      : > "$slot/gate" 2>/dev/null
+      printf '%s pid=%s since=%s ticket=%s\n' "$name" "$$" "$(date '+%FT%T')" "$tb" > "$slot/owner"
+      break
+    fi
+    reaped=0; for s in "${slots[@]}"; do reap_slot "$s" && { reaped=1; break; }; done
+    [ "$reaped" -eq 1 ] && continue
+  fi
+  if [ "$waited" -ge "$notice_after" ] && [ "$told" -eq 0 ]; then
+    printf 'agent-job-semaphore: waiting for a slot held by %s for %ss; if an owner is dead, free it by removing its dir AND its ticket: rm -rf %s  (queue: %s)\n' \
+      "$(holder)" "$waited" "$(escape)" "$(queue_names)" >&2
+    told=1
+  fi
+  sleep "$poll"; waited=$((SECONDS - start))
+  reap_tickets
+  # Removed by another process while alive (a heartbeat starved past AJS_STALE): back to the same place.
+  [ -e "$ticket" ] || { beat_off; : > "$ticket" 2>/dev/null || refuse "cannot write a ticket"; beat_on; note "lost its ticket while alive; back in its place as $tb"; }
+done
+
+# The gate, per slot, once held: load1 below the budget times (slots running a command + this one), since a
+# slot waiting at its gate loads nothing; behind an earlier ticket still at its gate unless that one went
+# silent; and, with another slot busy, memory for one more. A slot at its gate counts only for later ones.
+other_slots() {
+  local s o t; others=0; running=0; ahead=
+  for s in "$dir"/slot.*; do
+    [ "$s" != "$slot" ] && [ -d "$s" ] || continue
+    if [ -e "$s/gate" ]; then
+      o=; { read -r o < "$s/owner"; } 2>/dev/null; t=${o##* ticket=}
+      if [ "$t" != "$o" ]; then [[ $t < $tb ]] || continue; fresh_slot "$s" && ahead=$o; fi
+    else running=$((running + 1)); fi
+    others=$((others + 1))
+  done
+}
+load_ok() { local a; a=$(centi "$(load1)") || return 1; [ "$a" -lt $((loadmax_c * (running + 1))) ]; }
+load_cap() {
+  if [ "$running" -eq 0 ]; then show_centi "$loadmax_c"
+  else printf '%s (%s per slot, %d slots)' "$(show_centi $((loadmax_c * (running + 1))))" "$(show_centi "$loadmax_c")" $((running + 1)); fi
+}
+mem_ok() {
+  [ "$others" -eq 0 ] && return 0
+  local k v avail= sfree= stotal= reserve line= psi=
+  { while read -r k v _; do case $k in MemAvailable:) avail=$v ;; SwapFree:) sfree=$v ;; SwapTotal:) stotal=$v ;; esac; done < "$meminfo"; } 2>/dev/null
+  is_uint "$avail" && is_uint "$sfree" && is_uint "$stotal" || { mem_why="cannot read MemAvailable, SwapFree and SwapTotal in $meminfo"; return 1; }
+  reserve=$((stotal / 4)); [ "$reserve" -gt "$swap_cap_kib" ] && reserve=$swap_cap_kib
+  # Machine-wide PSI: a cgroup's own pressure is often invisible from a sandbox; a kernel without PSI does not gate.
+  { read -r line < "$pressure"; } 2>/dev/null; [[ $line =~ ^some\ avg10=([0-9]+\.[0-9]+) ]] && psi=${BASH_REMATCH[1]}
+  mem_why="MemAvailable $((avail / 1024)) MiB, minimum $((mem_min_kib / 1024)); SwapFree $((sfree / 1024)) MiB, reserve $((reserve / 1024)) below $((mem_roomy_kib / 1024)); PSI some avg10 ${psi:-unread}, maximum $psi_max"
+  [ "$avail" -ge "$mem_min_kib" ] && { [ "$stotal" -eq 0 ] || [ "$avail" -ge "$mem_roomy_kib" ] || [ "$sfree" -gt "$reserve" ]; } &&
+    { [ -z "$psi" ] || [ "${psi%.*}" -lt "$psi_max" ]; }
+}
+gstart=$SECONDS; waited=0; told=0
+while :; do
+  other_slots
+  if ! load_ok; then
+    if [ "$waited" -ge "$timeout" ]; then printf 'agent-job-semaphore: load1 %s >= %s after %ss\n' "$(load1)" "$(load_cap)" "$waited" >&2; exit 75; fi
+    [ "$waited" -ge "$notice_after" ] && [ "$told" -eq 0 ] && { printf 'agent-job-semaphore: waiting for load1 < %s (now %s) for %ss\n' "$(load_cap)" "$(load1)" "$waited" >&2; told=1; }
+  elif [ -n "$ahead" ]; then
+    if [ "$waited" -ge "$timeout" ]; then printf 'agent-job-semaphore: an earlier ticket is still at its gate (%s) after %ss\n' "$ahead" "$waited" >&2; exit 75; fi
+    [ "$waited" -ge "$notice_after" ] && [ "$told" -eq 0 ] && { printf 'agent-job-semaphore: waiting behind an earlier ticket at its gate (%s) for %ss\n' "$ahead" "$waited" >&2; told=1; }
+  elif ! mem_ok; then
+    if [ "$waited" -ge "$timeout" ]; then printf 'agent-job-semaphore: no memory for another slot (%s) after %ss\n' "$mem_why" "$waited" >&2; exit 75; fi
+    [ "$waited" -ge "$notice_after" ] && [ "$told" -eq 0 ] && { printf 'agent-job-semaphore: waiting for memory for another slot (%s) for %ss\n' "$mem_why" "$waited" >&2; told=1; }
+  else
+    break
+  fi
+  sleep "$gate_poll"; waited=$((SECONDS - gstart))
+done
+rm -f "$slot/gate"
+
+# jest or vitest must be the program that runs: its basename, or the one after timeout <s>, npx/node (and
+# their options) or pnpm exec. A wrapper that merely names them (vitest-part.sh) sets its own workers.
+runner_is_jest_or_vitest() {
+  local -a a=("$@"); local i=0 w
+  while [ "$i" -lt "${#a[@]}" ]; do
+    w=${a[i]##*/}
+    case $w in
+      jest|jest.js|vitest|vitest.mjs) return 0 ;;
+      timeout) i=$((i + 2)) ;;
+      npx|node) i=$((i + 1)); while [[ ${a[i]:-} == -* ]]; do i=$((i + 1)); done ;;
+      pnpm) [ "${a[i + 1]:-}" = exec ] || return 1; i=$((i + 2)) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 1
+}
+# jest and vitest default to one worker per core, which is what overloads a shared machine.
+if [ "$jest_workers" -gt 0 ] && runner_is_jest_or_vitest "$@"; then
+  case "$*" in *maxWorkers*|*max-workers*) ;; *) set -- "$@" "--maxWorkers=$jest_workers" ;; esac
+fi
+
+label=$(basename -- "$(realpath -- "$workdir")"); [ "$label" != / ] || label=root
+# The pid keeps two runs of one name that start in the same second from writing the same file.
+log=$out/ajs-$label-$(date +%Y%m%dT%H%M%S)-$$.log
+la=$(load1); t0=$(date +%H:%M:%S)
+(
+  if [ "$caller_lc_set" = 1 ]; then LC_ALL=$caller_lc_all; else unset LC_ALL; fi
+  cd -- "$workdir" && exec "$@"
+) > "$log" 2>&1 &
+child=$!; wait "$child"; rc=$?; child=0
+t1=$(date +%H:%M:%S); lb=$(load1)
+summary=
+while IFS= read -r l; do [[ $l =~ $summary_re ]] && summary=$l; done < <(tail -n 2000 -- "$log")
+summary=${summary#"${summary%%[![:space:]]*}"}
+line="ajs $label rc=$rc $t0->$t1 load1 $la->$lb ${summary:-no test summary} (output: $log)"
+printf '%s\n' "$line"
+[ -z "$append" ] || printf '%s %s: %s\n' "$(date '+%F %T')" "$name" "$line" >> "$append"
+exit "$rc"
