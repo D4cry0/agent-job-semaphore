@@ -25,7 +25,7 @@ cleanup() {
 trap cleanup EXIT
 while IFS='=' read -r v _; do case $v in AJS_*) unset "$v" ;; esac; done < <(env)
 export HOME=$TMP/home XDG_RUNTIME_DIR=$TMP/xdg-runtime XDG_STATE_HOME=$TMP/xdg-state
-export AJS_BEAT=1 AJS_STALE=3 AJS_POLL=1 AJS_SLOTS=1
+export AJS_BEAT=1 AJS_STALE=5 AJS_POLL=1
 mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
 : > "$TMP/results"; : > "$TMP/names"
 ( while :; do
@@ -40,17 +40,17 @@ skip() { echo "skip $1 - $2"; }
 check() { if eval "$2"; then ok "$1"; else ko "$1" "$2"; fi; }   # check <name> <bash condition>
 
 fresh() {  # a new lock dir and default inputs: load 0.50, 16 GiB available, 8 GiB swap free, PSI 0
-  R=$(mktemp -d "$TMP/r.XXXXXX"); D=$R/lock; Q=$D/queue; LOG=$D/events.log; S1=$D/slot.1; S2=$D/slot.2
+  R=$(mktemp -d "$TMP/r.XXXXXX"); D=$R/lock; Q=$D/queue; LOG=$D/events.log; W1=$D/win.1; W2=$D/win.2
   mkdir -p "$R/repo" "$R/out"
   export AJS_DIR=$D AJS_LOADAVG_FILE=$R/loadavg AJS_MEMINFO_FILE=$R/meminfo AJS_PSI_FILE=$R/pressure
   load_set 0.50; mem_set 16777216 8388608 8388608; psi_set 0.00
 }
 note_name() { echo "$1" >> "$TMP/names"; }
-sw() {  # sw [options] -- <cmd...>: one run with a huge load budget, raw output in $R/out
+sw() {  # sw [options] -- <cmd...>: one run with a huge CPU budget, raw output in $R/out
   local a; for a; do note_name "$a"; done
   "${AJS_OVERRIDE:-$AJS}" -C "$R/repo" --load-max 1000 --out "$R/out" --timeout 30 "$@"
 }
-swt() {  # swt <s> [options] -- <cmd...>: the queue never times out; an outer timeout of <s> s cuts it (rc 124)
+swt() {  # swt <s> [options] -- <cmd...>: no --timeout; an outer timeout of <s> s cuts it (rc 124)
   local s=$1 a; shift; for a; do note_name "$a"; done
   timeout "$s" "${AJS_OVERRIDE:-$AJS}" -C "$R/repo" --load-max 1000 --out "$R/out" "$@"
 }
@@ -68,50 +68,51 @@ tickets() { ls "$Q" 2>/dev/null | wc -l; }
 queued() { until_ 5 "ls '$Q' 2>/dev/null | grep -q -- '-$1\$'"; }
 pid_of() { ls "$Q" | sed -n "s/^[0-9]*-\([0-9]*\)-$1\$/\1/p"; }   # the script's pid is in its ticket name
 raw_of() { sed -n 's/.*(output: \(.*\))$/\1/p' "$1"; }
+wins() { ls -d "$D"/win.* 2>/dev/null | wc -l; }
+noev() { [ -z "$(grep -v ' peak class=' "$LOG" 2>/dev/null)" ]; }   # no event in the log but the peaks of finished runs
 shim() {  # shim <dir> <cmd...>: wrappers that log each call to <dir>/count and run the real command
   local d=$1 c; shift; mkdir -p "$d"
   for c in "$@"; do printf '#!/bin/bash\necho %s >> %q\nexec %q "$@"\n' "$c" "$d/count" "$(command -v "$c")" > "$d/$c"; chmod +x "$d/$c"; done
 }
-fake_head() {  # slot 1 held by a live owner that is not a test process, and <n> live tickets ahead of the next one
-  mkdir -p "$Q" "$S1"; echo "f pid=1 since=x ticket=1000-1-f" > "$S1/owner"; touch -d '+1 min' "$S1/owner"
-  local i; for ((i = 1; i <= $1; i++)); do touch -d '+1 min' "$Q/1000$(printf %03d "$i")-1-f$i"; done
+fake_win() {  # fake_win <k> <bytes>: window <k> held by a live owner that is not a test process, with its live ticket
+  local k=$1; mkdir -p "$Q" "$D/win.$k"
+  echo "f$k pid=1 since=x ticket=1000-$k-f$k" > "$D/win.$k/owner"; echo "class=fake bytes=$2 source=log cpu=1" > "$D/win.$k/weight"
+  : > "$Q/1000-$k-f$k"; touch -d '+10 min' "$D/win.$k/owner" "$Q/1000-$k-f$k"
 }
-SUMMARY='^ajs repo rc=0 [0-9:]{8}->[0-9:]{8} load1 [0-9.]+->[0-9.]+ Tests: 3 passed, 3 total \(output: .*\)$'
-# Slot scenarios' command: "+ <name> <ns>" on entry and "- <name> <ns>" on exit, in $R/ev.
+fake_ticket() {  # fake_ticket <seconds old> <name> <bytes> [cpu]: a live ticket that arrived that long ago
+  mkdir -p "$Q"; local f; f="$(($(date +%s) - $1))000000000-1-$2"
+  printf 'class=fake bytes=%s cpu=%s' "$3" "${4:-1}" > "$Q/$f"; touch -d '+10 min' "$Q/$f"
+}
+peakline() {  # peakline <class> <bytes> [cpu hundredths] [date]: a finished run's peak in the log
+  mkdir -p "$D"; printf '%s agent-job-semaphore: x peak class=%s bytes=%s rc=0 s=5 cpu=%s\n' "${4:-$(date '+%F %T')}" "$1" "$2" "${3:-100}" >> "$LOG"
+}
+field() { sed -n "s/.* $2=\([^ ]*\).*/\1/p" <<<"$1"; }
+SUMMARY='^ajs repo rc=0 [0-9:]{8}->[0-9:]{8} load1 [0-9.]+->[0-9.]+ Tests: 3 passed, 3 total( uncontained)? \(output: .*\)$'
+# Window scenarios' command: "+ <name> <ns>" on entry and "- <name> <ns>" on exit, in $R/ev.
 EV='echo "+ $1 $(date +%s%N)" >> "$0"; sleep "$2"; echo "- $1 $(date +%s%N)" >> "$0"'
 started() { grep -q "^+ $1 " "$R/ev" 2>/dev/null; }
+ended() { grep -q "^- $1 " "$R/ev" 2>/dev/null; }
 ev_at() { awk -v k="$1" -v n="$2" '$1 == k && $2 == n {print $3}' "$R/ev"; }
 overlap() { [ "$(ev_at + "$2")" -lt "$(ev_at - "$1")" ] && [ "$(ev_at + "$1")" -lt "$(ev_at - "$2")" ]; }
 first_end() { local x y; x=$(ev_at - "$1"); y=$(ev_at - "$2"); echo $((x < y ? x : y)); }
 max_conc() { sort -k3,3n "$R/ev" | awk '{c += ($1 == "+") ? 1 : -1; if (c > m) m = c} END {print m + 0}'; }
-acq_shim() {  # a mkdir that logs "<name> <slot>" each time a run takes a slot: the order of entry
-  local d=$R/acq-bin real; real=$(command -v mkdir); mkdir -p "$d"
-  cat > "$d/mkdir" <<EOF
-#!/bin/bash
-for a; do last=\$a; done
-$real "\$@"; rc=\$?
-if [ \$rc = 0 ]; then case \$last in "$D"/slot.*) echo "\$(tr '\\0' '\\n' < /proc/\$PPID/cmdline | sed -n '/^-n\$/{n;p;q}') \${last##*/}" >> "$R/acq" ;; esac; fi
-exit \$rc
-EOF
-  chmod +x "$d/mkdir"; export PATH="$d:$PATH"
-}
-acq_order() { cut -d' ' -f1 "$R/acq" 2>/dev/null | tr '\n' ' '; }
 mem_set() {  # mem_set <MemAvailable kB> <SwapTotal kB> <SwapFree kB>
   printf 'MemTotal: 33554432 kB\nMemAvailable: %s kB\nSwapTotal: %s kB\nSwapFree: %s kB\n' "$@" > "$R/meminfo.new"; mv -f "$R/meminfo.new" "$R/meminfo"
 }
 psi_set() { printf 'some avg10=%s avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' "$1" > "$R/pressure.new"; mv -f "$R/pressure.new" "$R/pressure"; }
 load_set() { printf '%s %s %s 1/100 1\n' "$1" "$1" "$1" > "$R/loadavg.new"; mv -f "$R/loadavg.new" "$R/loadavg"; }
 not_root() { [ "$(id -u)" != 0 ]; }
+GIB=1073741824
 
 t_summary_line() {
   fresh; out=$(sw -n a -- sh -c 'echo "Tests: 3 passed, 3 total"'); rc=$?
-  check summary-line-and-clean-queue '[ $rc = 0 ] && [[ $out =~ $SUMMARY ]] && [ "$(wc -l <<<"$out")" = 1 ] && [ -z "$(ls -A "$Q")" ] && [ ! -e "$S1" ] && [ ! -e "$LOG" ]'
+  check summary-line-and-clean-queue '[ $rc = 0 ] && [[ $out =~ $SUMMARY ]] && [ "$(wc -l <<<"$out")" = 1 ] && [ -z "$(ls -A "$Q")" ] && [ "$(wins)" = 0 ] && noev'
   sw -n a --append-to "$R/journal" -- sh -c 'exit 7' > "$R/b.out"; rc=$?
-  check command-rc-and-append-to '[ $rc = 7 ] && grep -q " rc=7 .* no test summary " "$R/b.out" && grep -Eq "^[0-9-]{10} [0-9:]{8} a: ajs repo rc=7 " "$R/journal"'
+  check command-rc-and-append-to '[ $rc = 7 ] && grep -q " rc=7 .* no test summary" "$R/b.out" && grep -Eq "^[0-9-]{10} [0-9:]{8} a: ajs repo rc=7 " "$R/journal"'
   sw -n a -- sh -c 'echo "Tests: 1 failed, 3 total"; echo "   Tests:  2 passed, 3 total"; echo trailing' > "$R/c.out"
-  check summary-is-the-last-matching-line-trimmed 'grep -Eq "load1 [0-9.]+->[0-9.]+ Tests:  2 passed, 3 total \(output: " "$R/c.out"'
+  check summary-is-the-last-matching-line-trimmed 'grep -Eq "load1 [0-9.]+->[0-9.]+ Tests:  2 passed, 3 total( uncontained)? \(output: " "$R/c.out"'
   AJS_SUMMARY_REGEX='^=+ [0-9]+ passed' sw -n a -- sh -c 'echo "===== 5 passed in 0.12s ====="' > "$R/p.out"
-  check summary-regex-is-configurable 'grep -q " ===== 5 passed in 0.12s ===== (output: " "$R/p.out"'
+  check summary-regex-is-configurable 'grep -q " ===== 5 passed in 0.12s =====\( uncontained\)\? (output: " "$R/p.out"'
 }
 
 t_default_output_dir() {  # under XDG_STATE_HOME, else HOME/.local/state; --out and AJS_OUT win; no home: TMPDIR
@@ -162,10 +163,10 @@ t_unusable_lock_dir_is_refused() {  # rc 78 and the command never runs
   mkdir -p "$D"; : > "$Q"
   swt 10 -n a -- touch "$R/ran3" > /dev/null 2> "$R/e3"; rc=$?
   check queue-that-is-a-file-rc78 '[ $rc = 78 ] && [ ! -e "$R/ran3" ] && grep -q "queue is not a directory" "$R/e3"'
-  rm -f "$Q"; : > "$S1"
+  rm -f "$Q"; : > "$W1"
   swt 10 -n a -- touch "$R/ran5" > /dev/null 2> "$R/e5"; rc=$?
-  check slot-that-is-a-file-rc78 '[ $rc = 78 ] && [ ! -e "$R/ran5" ] && grep -q "slot.1 is not a directory" "$R/e5"'
-  rm -f "$S1"
+  check window-that-is-a-file-rc78 '[ $rc = 78 ] && [ ! -e "$R/ran5" ] && grep -q "win.1 is not a directory" "$R/e5"'
+  rm -f "$W1"
   if not_root; then
     mkdir -p "$R/ro"; chmod 500 "$R/ro"
     AJS_DIR=$R/ro swt 10 -n a -- touch "$R/ran2" > /dev/null 2> "$R/e2"; rc=$?
@@ -179,23 +180,25 @@ t_unusable_lock_dir_is_refused() {  # rc 78 and the command never runs
   fi
 }
 
-t_slot_turned_file_at_take_time() {  # the slot path becomes a file between the check and the mkdir
+t_window_turned_file_at_take_time() {  # the window path becomes a file between the check and the mkdir
   fresh; mkdir -p "$R/mkdir-shim"
-  printf '#!/bin/bash\nfor a in "$@"; do\n  if [ "$a" = %q ]; then : > %q; exit 1; fi\ndone\nexec %q "$@"\n' "$S1" "$S1" "$(command -v mkdir)" > "$R/mkdir-shim/mkdir"
+  printf '#!/bin/bash\nfor a in "$@"; do\n  if [ "$a" = %q ]; then : > %q; exit 1; fi\ndone\nexec %q "$@"\n' "$W1" "$W1" "$(command -v mkdir)" > "$R/mkdir-shim/mkdir"
   chmod +x "$R/mkdir-shim/mkdir"
   PATH="$R/mkdir-shim:$PATH" swt 8 -n a --timeout 3 -- touch "$R/ran" > /dev/null 2> "$R/e"; rc=$?
-  check slot-turned-file-at-take-time-rc78-without-running '[ $rc = 78 ] && [ ! -e "$R/ran" ] && grep -q "slot.1 is not a directory" "$R/e"'
+  check window-turned-file-at-take-time-rc78-without-running '[ $rc = 78 ] && [ ! -e "$R/ran" ] && grep -q "win.1 is not a directory" "$R/e"'
 }
 
 t_settings_out_of_range_are_refused() {  # every AJS_* value is checked before anything is written
   fresh; local spec i=0
-  for spec in AJS_SLOTS=0 AJS_SLOTS=17 AJS_SLOTS=x AJS_BEAT=0 AJS_STALE=2 AJS_POLL=0 AJS_GATE_POLL=0 \
-    AJS_NOTICE_AFTER=0 AJS_MEM_MIN_MIB=-1 AJS_MEM_ROOMY_MIB=x AJS_SWAP_RESERVE_MIB=1.5 AJS_PSI_MAX=1.5 \
+  for spec in AJS_BEAT=0 AJS_STALE=2 AJS_POLL=0 AJS_POLL=4 AJS_NOTICE_AFTER=0 AJS_HOLD_AFTER=0 AJS_RESERVE_GIB=0 AJS_RESERVE_GIB=65 \
+    AJS_MEM_MIN_MIB=-1 AJS_MEM_ROOMY_MIB=x AJS_SWAP_RESERVE_MIB=1.5 AJS_PSI_MAX=1.5 AJS_TASKS_MAX=5 AJS_KILL_MEM_MIB=1 \
     AJS_JEST_WORKERS=x AJS_LOAD_MAX=0 AJS_LOAD_MAX=abc; do
     i=$((i + 1)); timeout 20 env "$spec" "$AJS" -C "$R/repo" --out "$R/out" -- touch "$R/ran-$i" > /dev/null 2> "$R/s$i.err"; rc=$?
     check "setting-$spec-refused-rc78" "[ \$rc = 78 ] && [ ! -e '$R/ran-$i' ] && grep -qF '${spec%%=*}' '$R/s$i.err' && [ ! -e '$D' ]"
   done
-  for spec in AJS_SLOTS=1 AJS_SLOTS=2 AJS_SLOTS=16 AJS_LOAD_MAX=2.5; do
+  timeout 20 env AJS_BEAT=5 AJS_STALE=9 "$AJS" -C "$R/repo" --out "$R/out" -- touch "$R/ran-stale" > /dev/null 2> "$R/stale.err"; rc=$?
+  check stale-must-exceed-twice-beat '[ $rc = 78 ] && [ ! -e "$R/ran-stale" ] && grep -qF "must be more than twice AJS_BEAT" "$R/stale.err"'
+  for spec in AJS_RESERVE_GIB=1 AJS_RESERVE_GIB=64 AJS_LOAD_MAX=2.5 AJS_TASKS_MAX=100 AJS_JEST_WORKERS=0; do
     timeout 20 env "$spec" "$AJS" -C "$R/repo" --out "$R/out" -- true > /dev/null 2>&1; rc=$?
     check "setting-$spec-accepted" '[ $rc = 0 ]'
   done
@@ -203,16 +206,22 @@ t_settings_out_of_range_are_refused() {  # every AJS_* value is checked before a
 
 t_usage_errors() {
   fresh; local i=0 args
-  for args in '--timeout x' '--load-max 0' '--dir /nonexistent-ajs-dir' '--bogus' '-n'; do
+  for args in '--timeout x' '--load-max 0' '--dir /nonexistent-ajs-dir' '--bogus' '-n' '--mem 0' '--mem 65' '--mem 1.55' '--cpu 0' '--cpu 65' \
+    '--class UPPER' '--class 1abc' '--max-runtime 0' '--max-runtime 1000000'; do
     i=$((i + 1))
     # shellcheck disable=SC2086
     timeout 20 "$AJS" $args -- touch "$R/ran-$i" > /dev/null 2> "$R/u$i.err"; rc=$?
-    check "usage-error-${args%% *}-rc2" "[ \$rc = 2 ] && [ ! -e '$R/ran-$i' ] && [ ! -e '$D' ]"
+    check "usage-error-$i-${args%% *}-rc2" "[ \$rc = 2 ] && [ ! -e '$R/ran-$i' ] && [ ! -e '$D' ]"
   done
   "$AJS" -C "$R/repo" > /dev/null 2>&1; rc=$?
   check usage-without-command-rc2 '[ $rc = 2 ] && [ ! -e "$D" ]'
+  "$AJS" --fits default -- true > /dev/null 2>&1; rc=$?
+  check fits-with-a-command-rc2 '[ $rc = 2 ] && [ ! -e "$D" ]'
+  "$AJS" --fits > /dev/null 2>&1; rc=$?
+  check fits-without-a-class-rc2 '[ $rc = 2 ]'
   "$AJS" --help > "$R/help"; rc=$?
-  check help-names-every-exit-code '[ $rc = 0 ] && grep -q "^  73 " "$R/help" && grep -q "^  75 " "$R/help" && grep -q "^  78 " "$R/help" && grep -q "^  130/143 " "$R/help"'
+  check help-names-every-exit-code '[ $rc = 0 ] && grep -q "^  73 " "$R/help" && grep -q "^  75 " "$R/help" && grep -q "^  78 " "$R/help" && grep -q "^  124 " "$R/help" && grep -q "^  130/143 " "$R/help"'
+  check version-is-printed '[ "$("$AJS" --version)" = "agent-job-semaphore 0.2.0" ]'
 }
 
 t_command_keeps_caller_environment() {  # the bench's LC_ALL=C for sorting never reaches the command
@@ -228,14 +237,14 @@ t_command_keeps_caller_environment() {  # the bench's LC_ALL=C for sorting never
 }
 
 t_duplicate_name() {
-  fresh; bg x x -- sleep 3; until_ 5 '[ -d "$S1" ]'; tk=$(ls "$Q")
+  fresh; bg x x -- sleep 3; until_ 5 '[ -d "$W1" ]'; tk=$(ls "$Q")
   t0=$(date +%s%N); sw -n x -- touch "$R/second-ran" > /dev/null 2> "$R/dup.err"; rc=$?; ms=$((($(date +%s%N) - t0) / 1000000))
   check one-ticket-per-name-second-exits-73-at-once '[ $rc = 73 ] && [ $ms -lt 2000 ] && [ ! -e "$R/second-ran" ] && [ "$(ls "$Q")" = "$tk" ] && grep -qF "$tk" "$R/dup.err"'
   check one-ticket-per-name-leaves-the-first-alone '[ "$(rc_of x)" = 0 ] && [ -z "$(ls -A "$Q")" ]'
 }
 
 t_duplicate_name_race() {  # five processes with one name start together after a barrier
-  fresh; bg z z -- sleep 2; until_ 5 '[ -d "$S1" ]'
+  fresh; bg z z -- sleep 2; until_ 5 '[ -d "$W1" ]'
   for i in 1 2 3 4 5; do
     { until [ -e "$R/go" ]; do sleep 0.01; done; sw -n y -- sh -c 'echo y >> "$0"' "$R/runs" > /dev/null 2>&1; echo $? > "$R/y$i.rc"; } &
     kids+=($!)
@@ -246,116 +255,351 @@ t_duplicate_name_race() {  # five processes with one name start together after a
   check one-ticket-per-name-race-lets-one-through '[ "$rcs" = "0 73 73 73 73 " ] && [ "$(wc -l < "$R/runs")" = 1 ]'
 }
 
-t_fifo() {
-  fresh; bg z z -- sleep 2; until_ 5 '[ -d "$S1" ]'
-  for n in a b c; do bg "$n" "$n" -- sh -c 'echo "$1" >> "$0"' "$R/order" "$n"; queued "$n"; done
-  for n in a b c; do rc_of "$n" 20 > /dev/null; done
-  check fifo-order-kept '[ "$(rcs a b c)" = 000 ] && [ "$(tr "\n" " " < "$R/order")" = "a b c " ] && [ ! -e "$LOG" ]'
+# ---- the weight of a window: what the runs of its class measured --------------------------------------------------------
+
+t_class_weighs_its_peaks() {  # --fits reads the log and touches nothing
+  fresh; local o
+  o=$("$AJS" --fits pgx --load-max 1000)
+  check no-measure-weighs-the-reserve '[ "$(field "$o" estimate)" = $((3 * GIB)) ] && [ "$(field "$o" source)" = default ] && [ "$(field "$o" cpu)" = 1 ] && [ ! -e "$D" ]'
+  o=$(AJS_RESERVE_GIB=5 "$AJS" --fits pgx --load-max 1000)
+  check reserve-is-configurable '[ "$(field "$o" estimate)" = $((5 * GIB)) ]'
+  peakline pgx $((4 * GIB)) 250
+  o=$("$AJS" --fits pgx --load-max 1000)
+  check measured-peak-and-cpu-weigh-the-class '[ "$(field "$o" estimate)" = $((4 * GIB)) ] && [ "$(field "$o" source)" = log ] && [ "$(field "$o" cpu)" = 3 ]'
+  o=$("$AJS" --fits other --load-max 1000)
+  check another-class-is-not-affected '[ "$(field "$o" source)" = default ]'
+  fresh; peakline many $((9 * GIB)); local i; for i in $(seq 19); do peakline many $((2 * GIB)); done; peakline many $((6 * GIB))
+  o=$("$AJS" --fits many --load-max 1000)
+  check class-weighs-the-largest-of-its-last-20 '[ "$(field "$o" estimate)" = $((6 * GIB)) ]'
+  fresh; peakline small 100000000
+  o=$("$AJS" --fits small --load-max 1000)
+  check weight-has-a-floor-of-one-gib '[ "$(field "$o" estimate)" = $GIB ] && [ "$(field "$o" source)" = log ]'
+  fresh; peakline old $((9 * GIB)) 100 "$(date -d '-8 days' '+%F %T')"; peakline future $((9 * GIB)) 100 "$(date -d '+2 hours' '+%F %T')"
+  o=$("$AJS" --fits old --load-max 1000); p=$("$AJS" --fits future --load-max 1000)
+  check peaks-older-than-7-days-or-in-the-future-do-not-count '[ "$(field "$o" source)" = default ] && [ "$(field "$p" source)" = default ]'
+  fresh; for i in $(seq 9); do peakline default $GIB; peakline big $GIB; done; peakline default $((10 * GIB)); peakline big $((10 * GIB))
+  o=$("$AJS" --fits default --load-max 1000); p=$("$AJS" --fits big --load-max 1000)
+  check default-class-weighs-the-p90-not-the-largest '[ "$(field "$o" estimate)" = $GIB ] && [ "$(field "$p" estimate)" = $((10 * GIB)) ]'
+  o=$("$AJS" --fits pgx --mem 2.5 --cpu 4 --load-max 1000)
+  check declared-estimate-wins '[ "$(field "$o" estimate)" = 2684354560 ] && [ "$(field "$o" source)" = declared ] && [ "$(field "$o" cpu)" = 4 ]'
+  fresh; o=$("$AJS" --fits jest --load-max 1000)
+  check jest-class-has-3-cores-by-default '[ "$(field "$o" cpu)" = 3 ]'
 }
 
-t_sigkill_owner() {  # real SIGKILL to the slot owner: its ticket and its slot are reaped
-  fresh; bg k k -- sh -c 'echo $$ > "$0"; exec sleep 60' "$R/k.child"; until_ 5 '[ -s "$R/k.child" ]'
+t_peak_is_registered() {  # a finished run leaves its peak, with its class, for the next one
+  fresh; fake_runners "$R/bin"
+  sw -n a --class pgx -- sleep 2 > /dev/null 2>&1
+  sw -n j -- "$R/bin/jest" x > /dev/null 2>&1
+  sw -n d -- sleep 2 > /dev/null 2>&1
+  check run-writes-its-peak-line 'grep -Eq "agent-job-semaphore: a peak class=pgx bytes=[1-9][0-9]* rc=0 s=[0-9]+ cpu=[0-9]+$" "$LOG"'
+  check jest-runner-is-class-jest 'grep -Eq " j peak class=jest bytes=[1-9][0-9]* " "$LOG"'
+  check unclassed-command-is-class-default 'grep -Eq " d peak class=default bytes=[1-9][0-9]* " "$LOG"'
+  o=$("$AJS" --fits pgx --load-max 1000)
+  check next-run-reads-the-measure '[ "$(field "$o" source)" = log ] && [ "$(field "$o" estimate)" -ge $GIB ]'
+}
+
+t_fits_counts_what_would_open() {
+  fresh; local o
+  o=$("$AJS" --fits default --load-max 1000); rc=$?
+  check fits-counts-an-empty-machine '[ $rc = 0 ] && [ "$(field "$o" would_open)" = 5 ] && [ "$(field "$o" running)" = 0 ] && [[ $o == *" reason=no memory for another window ("* ]] && [ ! -e "$D" ]'
+  fake_win 1 $((3 * GIB))
+  o=$("$AJS" --fits default --load-max 1000); rc=$?
+  check fits-counts-beside-a-running-window '[ $rc = 0 ] && [ "$(field "$o" would_open)" = 4 ] && [ "$(field "$o" running)" = 1 ]'
+  fake_ticket 2000 big $((6 * GIB)); fake_ticket 5 young $((6 * GIB))
+  o=$("$AJS" --fits default --load-max 1000)
+  check fits-counts-the-place-held-by-the-oldest-waiter '[ "$(field "$o" would_open)" = 2 ] && [ "$(field "$o" waiting)" = 2 ]'
+  fresh; fake_win 1 $((3 * GIB)); mem_set 5242880 0 0
+  o=$("$AJS" --fits default --load-max 1000); rc=$?
+  check fits-says-zero-and-why-with-rc1 '[ $rc = 1 ] && [ "$(field "$o" would_open)" = 0 ] && [[ $o == *"reason=no memory for another window (MemAvailable 5120 MiB, minimum 4096 and"* ]]'
+  fresh; load_set 5.00
+  o=$("$AJS" --fits default --load-max 4); rc=$?
+  check fits-names-the-cpu-gate '[ $rc = 1 ] && [[ $o == *"reason=no CPU for another window (load1 5.00;"* ]]'
+}
+
+# ---- entering: whole, when it fits, in no order ------------------------------------------------------------------------------
+
+t_windows_enter_while_they_fit() {  # 7 GiB: two reserves of 3 fit, the third waits for one to end
+  fresh; mem_set 7340032 0 0
+  for n in a b c; do bg "$n" "$n" -- sh -c "$EV" "$R/ev" "$n" 3; queued "$n"; done
+  for n in a b c; do rc_of "$n" 30 > /dev/null; done
+  check two-windows-run-together-when-they-fit '[ "$(rcs a b c)" = 000 ] && overlap a b'
+  check third-waits-until-one-ends '[ "$(max_conc)" = 2 ] && [ "$(ev_at + c)" -ge "$(first_end a b)" ] && [ "$(wins)" = 0 ] && [ -z "$(ls -A "$Q")" ] && noev'
+}
+
+t_nobody_waits_for_a_turn() {  # a small job enters ahead of a big one that arrived first and does not fit yet
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 2 -- sh -c "$EV" "$R/ev" z 6; until_ 5 'started z'
+  bg big big --mem 6 -- sh -c "$EV" "$R/ev" big 0; queued big
+  bg small small --mem 1 -- sh -c "$EV" "$R/ev" small 1; queued small
+  for n in z big small; do rc_of "$n" 30 > /dev/null; done
+  check small-enters-before-the-big-one-that-arrived-first '[ "$(rcs z big small)" = 000 ] && [ "$(ev_at + small)" -lt "$(ev_at + big)" ] && [ "$(ev_at + small)" -lt "$(ev_at - z)" ]'
+  check big-one-enters-when-it-fits '[ "$(ev_at + big)" -ge "$(ev_at - z)" ]'
+}
+
+t_waiter_over_hold_after_keeps_its_place() {  # an old live ticket is added to what runs; a young one is not
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 2 -- sh -c "$EV" "$R/ev" z 12; until_ 5 'started z'
+  fake_ticket 2000 big $((6 * GIB))
+  bg s s --mem 1 -- sh -c "$EV" "$R/ev" s 0; queued s; sleep 3
+  started s && held=no || held=yes
+  rm -f "$Q"/*-big; fake_ticket 5 young $((6 * GIB))
+  until_ 6 'started s'
+  check old-waiter-holds-its-place-and-a-young-one-does-not '[ "$held" = yes ] && started s && ! ended z'
+  rm -f "$Q"/*-young; for n in z s; do rc_of "$n" 30 > /dev/null; done
+  check waiters-finish-after-the-place-is-released '[ "$(rcs z s)" = 00 ]'
+}
+
+t_hold_after_is_configurable() {
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 2 -- sleep 6; until_ 5 '[ -d "$W1" ]'
+  fake_ticket 5 big $((6 * GIB))
+  AJS_HOLD_AFTER=2 bg s s --mem 1 -- sh -c "$EV" "$R/ev" s 0; sleep 4
+  check hold-after-env-makes-a-younger-ticket-hold-its-place '! started s'
+  rm -f "$Q"/*-big; rc_of s 20 > /dev/null; rc_of z 10 > /dev/null
+  fresh; mem_set 7340032 0 0   # a waiter that has waited long does not hold a place against itself
+  bg z z --mem 5 -- sh -c "$EV" "$R/ev" z 5; until_ 5 'started z'
+  AJS_HOLD_AFTER=1 bg w w --mem 4 -- sh -c "$EV" "$R/ev" w 0; rc_of w 25 > /dev/null; rc_of z 10 > /dev/null
+  check waiter-that-held-long-does-not-count-itself-twice '[ "$(rcs z w)" = 00 ] && [ "$(ev_at + w)" -ge "$(ev_at - z)" ]'
+}
+
+t_memory_gate() {  # alone it never waits for memory; the second waits for RAM, for swap when RAM is low, and for PSI
+  fresh; mem_set 1048576 0 0; psi_set 50.00
+  sw -n solo -- sh -c "$EV" "$R/ev" solo 0 > /dev/null 2>&1; rc=$?
+  check memory-gate-never-stops-the-first '[ $rc = 0 ] && started solo'
+  psi_set 0.00; bg z z -- sh -c "$EV" "$R/ev" z 26; until_ 5 'started z'
+  bg w w -- sh -c "$EV" "$R/ev" w 0; queued w
+  sleep 3; started w && low=no || low=yes
+  mem_set 6291456 8388608 1048576; sleep 3; started w && swap=no || swap=yes
+  mem_set 16777216 8388608 8388608; psi_set 25.00; sleep 3; started w && psi=no || psi=yes
+  mem_set 16777216 8388608 1048576; psi_set 9.99; rc_of w 20 > /dev/null; rc_of z 35 > /dev/null
+  check memory-gate-stops-the-second '[ "$low" = yes ]'
+  check swap-gate-stops-the-second '[ "$swap" = yes ]'
+  check psi-gate-stops-the-second '[ "$psi" = yes ]'
+  check memory-gate-opens-when-there-is-room '[ "$(rcs w z)" = 00 ] && [ "$(ev_at + w)" -lt "$(ev_at - z)" ] && [ "$(wins)" = 0 ]'
+  check used-swap-with-roomy-ram-does-not-stop '[ "$(rcs w z)" = 00 ] && [ "$(ev_at + w)" -lt "$(ev_at - z)" ]'
+}
+
+t_memory_counts_what_running_windows_can_still_grow() {  # 7 GiB: a window that declared 6 leaves no room for a 3
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 6 -- sh -c "$EV" "$R/ev" z 5; until_ 5 'started z'
+  bg w w -- sh -c "$EV" "$R/ev" w 0; queued w; sleep 2
+  started w && early=no || early=yes
+  bg v v --mem 0.5 -- sh -c "$EV" "$R/ev" v 0; sleep 3
+  check estimate-of-running-window-counts-until-it-ends '[ "$early" = yes ] && started v'
+  for n in z w v; do rc_of "$n" 30 > /dev/null; done
+  check waiter-enters-after-the-estimate-is-free '[ "$(rcs z w v)" = 000 ] && [ "$(ev_at + w)" -ge "$(ev_at - z)" ]'
+}
+
+t_timeout_names_the_gate() {
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 6 -- sleep 9; until_ 5 '[ -d "$W1" ]'
+  sw -n x --timeout 2 -- touch "$R/ran" > /dev/null 2> "$R/x.err"; rc=$?
+  check timeout-rc75-names-the-memory-gate '[ $rc = 75 ] && [ ! -e "$R/ran" ] && grep -Eq "^agent-job-semaphore: no memory for another window \(MemAvailable 7168 MiB, minimum 4096 and what the running windows can still grow plus this one 9[0-9]{3}; SwapFree 0 MiB, reserve 0 below 8192; PSI some avg10 0.00, maximum 10\) after [0-9]+s$" "$R/x.err" && [ "$(wins)" = 1 ]'
+  check timeout-leaves-the-queue '! ls "$Q" | grep -q -- "-x$"'
+  rc_of z 15 > /dev/null
+}
+
+t_without_timeout_it_waits_while_its_ticket_beats() {
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 6 -- sleep 8; until_ 5 '[ -d "$W1" ]'
+  swt 40 -n w -- sh -c 'echo w >> "$0"' "$R/order" > /dev/null 2>&1; rc=$?
+  check waiter-without-timeout-outlasts-twice-the-expiry '[ $rc = 0 ] && grep -qx w "$R/order" && noev'
+  rc_of z 15 > /dev/null
+}
+
+t_memory_thresholds_are_configurable() {
+  fresh; mem_set 1048576 0 0
+  bg z z --mem 0.1 -- sleep 15; until_ 5 '[ -d "$W1" ]'
+  AJS_MEM_MIN_MIB=512 sw -n x --mem 0.1 --timeout 3 -- true > /dev/null 2>&1; rc=$?
+  check memory-minimum-is-configurable '[ $rc = 0 ]'
+  mem_set 16777216 8388608 8388608; psi_set 5.00
+  AJS_PSI_MAX=3 sw -n y --timeout 2 -- true > /dev/null 2> "$R/y.err"; rc=$?
+  check psi-maximum-is-configurable '[ $rc = 75 ] && grep -qF "PSI some avg10 5.00, maximum 3" "$R/y.err"'
+  rc_of z 25 > /dev/null
+}
+
+t_memory_minimum() {  # below MemAvailable minimum even a small window waits, whatever its estimate
+  fresh; mem_set 1048576 0 0
+  bg z z --mem 0.1 -- sleep 6; until_ 5 '[ -d "$W1" ]'
+  sw -n x --mem 0.1 --timeout 2 -- touch "$R/ran" > /dev/null 2> "$R/x.err"; rc=$?
+  check memory-minimum-stops-even-a-small-window '[ $rc = 75 ] && [ ! -e "$R/ran" ] && grep -qF "MemAvailable 1024 MiB, minimum 4096 and" "$R/x.err"'
+  rc_of z 15 > /dev/null
+}
+
+t_cpu_budget() {  # load1 or the CPU the running windows weigh (the larger), plus the one asked, up to --load-max
+  fresh; load_set 3.50
+  sw -n a --load-max 4 --timeout 2 -- touch "$R/ran" > /dev/null 2> "$R/a.err"; rc=$?
+  check busy-machine-stops-even-the-first '[ $rc = 75 ] && [ ! -e "$R/ran" ] && grep -qF "no CPU for another window (load1 3.50; running windows weigh 0; the place held 0; this one 1; budget 4)" "$R/a.err"'
+  load_set 3.00
+  sw -n b --load-max 4 -- true > /dev/null 2>&1; rc=$?
+  check budget-is-reached-exactly-and-passes '[ $rc = 0 ]'
+  load_set 0.50
+  bg z z --load-max 4 --cpu 3 -- sleep 7; until_ 5 '[ -d "$W1" ]'
+  sw -n c --load-max 4 --cpu 2 --timeout 2 -- true > /dev/null 2> "$R/c.err"; rc=$?
+  check running-window-cpu-counts-while-load1-is-low '[ $rc = 75 ] && grep -qF "load1 0.50; running windows weigh 3; the place held 0; this one 2; budget 4" "$R/c.err"'
+  sw -n d --load-max 4 --cpu 1 --timeout 5 -- true > /dev/null 2>&1; rc=$?
+  check one-core-more-fits-beside-it '[ $rc = 0 ]'
+  rc_of z 15 > /dev/null
+  load_set 1.00; sw -n v --load-max 0.5 --timeout 2 -- true > /dev/null 2> "$R/v.err"; rc=$?
+  check fractional-budget '[ $rc = 75 ] && grep -qF "budget 0.50)" "$R/v.err"'
+  check default-budget-is-the-cores '[ "$("$AJS" --fits default | sed -n "s/.*would_open=\([0-9]*\).*/\1/p")" -ge 1 ]'
+}
+
+t_cpu_never_exceeds_the_cores() {  # no estimate asks for more cores than the machine has, and a window alone enters
+  fresh; local o
+  "$AJS" --fits pgx --cpu 5 --load-max 4 > /dev/null 2> "$R/c.err"; rc=$?
+  check declared-cpu-above-the-cores-is-refused '[ $rc = 2 ] && grep -qF -- "--cpu 5 needs more CPU than the machine has (4)" "$R/c.err"'
+  peakline pgx $((2 * GIB)) 900
+  o=$("$AJS" --fits pgx --load-max 4)
+  check a-peak-above-the-cores-weighs-the-cores '[ "$(field "$o" cpu)" = 4 ]'
+  o=$("$AJS" --fits jest --load-max 2)
+  check the-default-of-a-class-is-capped-too '[ "$(field "$o" cpu)" = 2 ]'
+  o=$("$AJS" --fits pgx --load-max 0.5)
+  check a-fractional-budget-still-weighs-one-core '[ "$(field "$o" cpu)" = 1 ]'
+  mkdir -p "$R/bin"; printf '#!/bin/sh\necho 1\n' > "$R/bin/nproc"; chmod +x "$R/bin/nproc"
+  o=$(PATH="$R/bin:$PATH" "$AJS" --fits jest)
+  check default-budget-is-fewer-when-the-process-may-use-fewer-cores '[ "$(field "$o" cpu)" = 1 ]'
+  load_set 0.50
+  sw -n a --class jest --load-max 2 --timeout 3 -- touch "$R/ran" > /dev/null 2>&1; rc=$?
+  check alone-it-enters-whatever-its-class-asks '[ $rc = 0 ] && [ -e "$R/ran" ]'
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 2 --load-max 4 -- sh -c "$EV" "$R/ev" z 8; until_ 5 'started z'
+  fake_ticket 2000 big $((6 * GIB)) 9
+  bg s s --mem 1 --load-max 4 -- sh -c "$EV" "$R/ev" s 0; until_ 6 'started s'
+  check a-waiter-asking-more-cores-than-there-are-holds-no-place 'started s && ! ended z'
+  rm -f "$Q"/*-big; for n in z s; do rc_of "$n" 30 > /dev/null; done
+}
+
+t_jest_weighs_the_p90() {  # like "default": a percentile of its own last 100 runs, not the largest of 20
+  fresh; local i o p
+  for i in $(seq 9); do peakline jest $GIB 100; peakline pgx $GIB 100; done; peakline jest $((10 * GIB)) 500; peakline pgx $((10 * GIB)) 500
+  o=$("$AJS" --fits jest --load-max 1000); p=$("$AJS" --fits pgx --load-max 1000)
+  check jest-weighs-the-p90-of-memory-and-cpu '[ "$(field "$o" estimate)" = $GIB ] && [ "$(field "$o" cpu)" = 1 ] && [ "$(field "$o" source)" = log ]'
+  check another-class-keeps-the-largest-of-20 '[ "$(field "$p" estimate)" = $((10 * GIB)) ] && [ "$(field "$p" cpu)" = 5 ]'
+  fresh; for i in $(seq 20); do peakline default $GIB 100; done; peakline jest $((10 * GIB)) 500
+  o=$("$AJS" --fits jest --load-max 1000)
+  check the-peaks-of-another-class-do-not-count-in-its-percentile '[ "$(field "$o" estimate)" = $((10 * GIB)) ]'
+}
+
+t_unreadable_loadavg_holds_the_gate() {  # a load that cannot be read never counts as low
+  fresh; export AJS_LOADAVG_FILE=$R/missing
+  sw -n x --timeout 1 -- touch "$R/ran" > /dev/null 2> "$R/x.err"; rc=$?
+  check unreadable-loadavg-holds-the-gate '[ $rc = 75 ] && [ ! -e "$R/ran" ] && grep -qF "load1 ?;" "$R/x.err"'
+}
+
+t_notice_names_the_gate_and_the_holders() {
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 6 -- sleep 8; until_ 5 '[ -d "$W1" ]'
+  AJS_NOTICE_AFTER=2 swt 20 -n w -- true > /dev/null 2> "$R/w.err"; rc=$?
+  check notice-says-why-and-who-holds '[ $rc = 0 ] && grep -Eq "^agent-job-semaphore: waiting for [23]s: no memory for another window \(.*\) \(running: z pid=[0-9]+ since=[^ ]+ ticket=[0-9]+-[0-9]+-z\)$" "$R/w.err"'
+  rc_of z 10 > /dev/null
+}
+
+# ---- liveness: dead tickets, orphaned windows, a stalled machine ----------------------------------------------------------
+
+t_sigkill_owner() {  # real SIGKILL to the window's owner: its ticket and its window are reaped by a waiter
+  fresh; mem_set 5242880 0 0
+  bg k k -- sh -c 'echo $$ > "$0"; exec sleep 60' "$R/k.child"; until_ 5 '[ -s "$R/k.child" ]'
   bg w w -- sh -c 'echo w >> "$0"' "$R/order"; until_ 5 '[ "$(tickets)" = 2 ]'
   kp=$(pid_of k); kill -9 "$kp"; kill -9 "$(cat "$R/k.child")"
-  check sigkill-owner-reaps-ticket-and-slot '[ "$(rc_of w 20)" = 0 ] && grep -qx w "$R/order" && grep -Eq "reaps dead ticket [0-9]+-$kp-k " "$LOG" && grep -q "reaps orphaned slot 1 (k pid=$kp " "$LOG" && [ -z "$(ls -A "$Q")" ] && [ ! -e "$S1" ]'
+  check sigkill-owner-reaps-ticket-and-window '[ "$(rc_of w 20)" = 0 ] && grep -qx w "$R/order" && grep -Eq "reaps dead ticket [0-9]+-$kp-k " "$LOG" && grep -q "reaps orphaned window 1 (k pid=$kp " "$LOG" && [ -z "$(ls -A "$Q")" ] && [ "$(wins)" = 0 ]'
 }
 
-t_signals_free_the_slot() {  # TERM and INT stop the command, free the slot and leave the queue
-  fresh; bg k k -- sh -c 'echo $$ > "$0"; exec sleep 60' "$R/k.child"; until_ 5 '[ -s "$R/k.child" ] && [ -s "$S1/owner" ]'
+t_signals_free_the_window() {  # TERM and INT stop the command, free the window and leave the queue
+  fresh; bg k k -- sh -c 'echo $$ > "$0"; exec sleep 60' "$R/k.child"; until_ 5 '[ -s "$R/k.child" ] && [ -s "$W1/owner" ]'
   kp=$(pid_of k); kill -TERM "$kp"
-  check term-exits-143-stops-command-and-frees-slot '[ "$(rc_of k 10)" = 143 ] && ! kill -0 "$(cat "$R/k.child")" 2>/dev/null && [ ! -e "$S1" ] && [ -z "$(ls -A "$Q")" ]'
+  check term-exits-143-stops-command-and-frees-window '[ "$(rc_of k 10)" = 143 ] && ! kill -0 "$(cat "$R/k.child")" 2>/dev/null && [ ! -e "$W1" ] && [ -z "$(ls -A "$Q")" ]'
   # A background job starts with SIGINT ignored; perl resets it as a foreground terminal would.
   { perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die' "$AJS" -C "$R/repo" --load-max 1000 --out "$R/out" -n i -- \
       sh -c 'echo $$ > "$0"; exec sleep 60' "$R/i.child" > /dev/null 2>&1; echo $? > "$R/i.rc"; } &
-  kids+=($!); until_ 5 '[ -s "$R/i.child" ] && [ -s "$S1/owner" ]'
+  kids+=($!); until_ 5 '[ -s "$R/i.child" ] && [ -s "$W1/owner" ]'
   kill -INT "$(pid_of i)"
-  check int-exits-130-stops-command-and-frees-slot '[ "$(rc_of i 10)" = 130 ] && ! kill -0 "$(cat "$R/i.child")" 2>/dev/null && [ ! -e "$S1" ] && [ -z "$(ls -A "$Q")" ]'
-  bg h h -- sleep 4; until_ 5 '[ -d "$S1" ]'; bg w w -- touch "$R/w-ran"; queued w
+  check int-exits-130-stops-command-and-frees-window '[ "$(rc_of i 10)" = 130 ] && ! kill -0 "$(cat "$R/i.child")" 2>/dev/null && [ ! -e "$W1" ] && [ -z "$(ls -A "$Q")" ]'
+  mem_set 7340032 0 0; bg h h --mem 6 -- sleep 4; until_ 5 '[ -d "$W1" ]'; bg w w -- touch "$R/w-ran"; queued w
   kill -TERM "$(pid_of w)"
-  check term-while-queued-exits-143-and-leaves-the-queue '[ "$(rc_of w 10)" = 143 ] && [ ! -e "$R/w-ran" ] && ! ls "$Q" | grep -q -- "-w$" && [ "$(rc_of h 10)" = 0 ]'
+  check term-while-waiting-exits-143-and-leaves-the-queue '[ "$(rc_of w 10)" = 143 ] && [ ! -e "$R/w-ran" ] && ! ls "$Q" | grep -q -- "-w$" && [ "$(rc_of h 10)" = 0 ]'
 }
 
-t_dead_ticket_at_head() {  # a dead ticket at the head of the queue is reaped; a live slot is never touched
-  fresh; fake_head 0; touch -d '+1 min' "$Q/1000-1-f"
-  bg k k -- true; until_ 5 '[ "$(tickets)" = 2 ]'
-  bg w w -- sh -c 'echo w >> "$0"' "$R/order"; until_ 5 '[ "$(tickets)" = 3 ]'
-  kill -9 "$(pid_of k)"
-  until_ 15 '! ls "$Q" | grep -q -- "-k$"'; sleep 2
-  check live-slot-is-not-touched '[ "$(cat "$S1/owner")" = "f pid=1 since=x ticket=1000-1-f" ] && ! grep -q "orphaned" "$LOG"'
-  rm -rf "$S1" "$Q/1000-1-f"
-  check dead-ticket-at-head-is-reaped '[ "$(rc_of w 10)" = 0 ] && grep -qx w "$R/order" && grep -Eq "reaps dead ticket [0-9]+-[0-9]+-k " "$LOG" && [ -z "$(ls -A "$Q")" ]'
+t_dead_ticket_of_a_waiter() {  # a dead ticket is reaped; a live window is never touched
+  fresh; mem_set 5242880 0 0; fake_win 1 $((3 * GIB)); : > "$Q/1000-9-dead"; touch -d '-1 min' "$Q/1000-9-dead"
+  bg w w -- sh -c 'echo w >> "$0"' "$R/order"; until_ 5 'grep -q "reaps dead ticket 1000-9-dead " "$LOG" 2>/dev/null'
+  sleep 2
+  check dead-ticket-is-reaped-and-live-window-is-not-touched '[ ! -e "$Q/1000-9-dead" ] && [ "$(cat "$W1/owner")" = "f1 pid=1 since=x ticket=1000-1-f1" ] && ! grep -q "orphaned" "$LOG" && ! started w'
+  rm -rf "$W1" "$Q/1000-1-f1"
+  check waiter-runs-when-the-window-is-gone '[ "$(rc_of w 10)" = 0 ] && grep -qx w "$R/order"'
 }
 
-t_slot_without_owner() {  # died between mkdir and writing the owner: the dir is reaped by its own mtime
-  fresh; mkdir -p "$S1"; touch -d '-1 min' "$S1"
+t_window_without_owner() {  # died between mkdir and writing the owner: the dir is reaped by its own mtime
+  fresh; mem_set 5242880 0 0; mkdir -p "$W1"; touch -d '-1 min' "$W1"
   bg w w -- true
-  check stale-slot-without-owner-is-reaped '[ "$(rc_of w 10)" = 0 ] && grep -q "reaps orphaned slot 1 (no owner)" "$LOG" && [ ! -e "$S1" ]'
+  check stale-window-without-owner-is-reaped '[ "$(rc_of w 10)" = 0 ] && grep -q "reaps orphaned window 1 (no owner)" "$LOG" && [ ! -e "$W1" ]'
 }
 
-t_slow_live_owner() {  # an owner three times longer than AJS_STALE, and a waiter that polls slower than that
-  fresh; bg l l -- sh -c 'sleep 9; echo l-end >> "$0"' "$R/order"; until_ 5 '[ -d "$S1" ]'
-  AJS_POLL=7 bg s s -- sh -c 'echo s >> "$0"' "$R/order"; until_ 5 '[ "$(tickets)" = 2 ]'
+t_slow_live_owner() {  # an owner more than twice AJS_STALE long, and waiters behind it
+  fresh; mem_set 5242880 0 0
+  bg l l -- sh -c 'sleep 12; echo l-end >> "$0"' "$R/order"; until_ 5 '[ -d "$W1" ]'
+  bg s s -- sh -c 'echo s >> "$0"' "$R/order"; until_ 5 '[ "$(tickets)" = 2 ]'
   bg w w -- sh -c 'echo w >> "$0"' "$R/order"
-  for n in l s w; do rc_of "$n" 30 > /dev/null; done
-  check slow-live-owner-is-not-reaped '[ "$(rcs l s w)" = 000 ] && [ "$(tr "\n" " " < "$R/order")" = "l-end s w " ] && [ ! -e "$LOG" ]'
+  for n in l s w; do rc_of "$n" 40 > /dev/null; done
+  check slow-live-owner-is-not-reaped '[ "$(rcs l s w)" = 000 ] && [ "$(head -n1 "$R/order")" = l-end ] && noev'
 }
 
-t_ticket_removed_from_live_waiter() {  # it returns to its place: the one behind does not overtake it
-  fresh; bg z z -- sleep 3; until_ 5 '[ -d "$S1" ]'
-  bg w1 w1 --timeout 15 -- sh -c 'echo w1 >> "$0"' "$R/order"; until_ 5 '[ "$(tickets)" = 2 ]'
-  bg w2 w2 -- sh -c 'echo w2 >> "$0"' "$R/order"; until_ 5 '[ "$(tickets)" = 3 ]'
+t_ticket_removed_from_live_waiter() {  # it comes back with its estimate
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 6 -- sleep 5; until_ 5 '[ -d "$W1" ]'
+  bg w1 w1 -- sh -c 'echo w1 >> "$0"' "$R/order"; until_ 5 '[ "$(tickets)" = 2 ]'
   tw1=$(ls "$Q" | grep -- '-w1$'); rm -f "$Q"/*-w1
-  check removed-ticket-of-live-waiter-returns-to-its-place '[ "$(rc_of w1 20)" = 0 ] && [ "$(rc_of w2 20)" = 0 ] && [ "$(tr "\n" " " < "$R/order")" = "w1 w2 " ] && grep -q "w1 lost its ticket while alive; back in its place as $tw1" "$LOG"'
+  check removed-ticket-of-live-waiter-comes-back '[ "$(rc_of w1 20)" = 0 ] && grep -qx w1 "$R/order" && grep -q "w1 lost its ticket while alive; back as $tw1" "$LOG"'
+  rc_of z 10 > /dev/null
 }
 
-t_ticket_removed_from_live_owner() {  # the slot's heartbeat is its owner file: without a ticket the owner stays
-  fresh; bg h h -- sh -c 'sleep 6; echo h-end >> "$0"' "$R/order"; until_ 5 '[ -d "$S1" ]'
+t_ticket_removed_from_live_owner() {  # the window's heartbeat is its owner file: without a ticket the owner stays
+  fresh; mem_set 5242880 0 0
+  bg h h -- sh -c 'sleep 8; echo h-end >> "$0"' "$R/order"; until_ 5 '[ -d "$W1" ]'
   bg w w -- sh -c 'echo w >> "$0"' "$R/order"; until_ 5 '[ "$(tickets)" = 2 ]'
   rm -f "$Q"/*-h
   for n in h w; do rc_of "$n" 20 > /dev/null; done
-  check removed-ticket-of-live-owner-keeps-the-slot '[ "$(rcs h w)" = 00 ] && [ "$(tr "\n" " " < "$R/order")" = "h-end w " ] && ! grep -qs slot "$LOG"'
+  check removed-ticket-of-live-owner-keeps-the-window '[ "$(rcs h w)" = 00 ] && [ "$(tr "\n" " " < "$R/order")" = "h-end w " ] && ! grep -qs window "$LOG"'
 }
 
-t_slot_moved_while_live() {  # between reading a stale owner and the mv, another process took a fresh slot
-  fresh; mkdir -p "$S1"; echo "k pid=5 since=x ticket=1-5-k" > "$S1/owner"; touch -d '-1 min' "$S1/owner"
+t_window_moved_while_live() {  # between reading a stale owner and the mv, another process took a fresh window
+  fresh; mem_set 5242880 0 0; mkdir -p "$W1"; echo "k pid=5 since=x ticket=1-5-k" > "$W1/owner"; touch -d '-1 min' "$W1/owner"
   mkdir -p "$R/swap"; cat > "$R/swap/mv" <<EOF
 #!/bin/bash
 for a; do last=\$a; done
-if [[ \$last == "$D/.reaped-slot.1-"* ]] && [ ! -e "$R/swap.done" ]; then
-  : > "$R/swap.done"; rm -rf "$S1"; mkdir "$S1"; echo "other pid=9 since=x ticket=1-9-other" > "$S1/owner"; touch -d '+1 min' "$S1/owner"
+if [[ \$last == "$D/.reaped-win.1-"* ]] && [ ! -e "$R/swap.done" ]; then
+  : > "$R/swap.done"; rm -rf "$W1"; mkdir "$W1"; echo "other pid=9 since=x ticket=1-9-other" > "$W1/owner"; touch -d '+1 min' "$W1/owner"
 fi
 exec $(command -v mv) "\$@"
 EOF
   chmod +x "$R/swap/mv"
   PATH=$R/swap:$PATH swt 5 -n w -- true > /dev/null 2>&1; rc=$?
-  check slot-moved-while-live-is-given-back '[ -e "$R/swap.done" ] && [ $rc = 124 ] && grep -q "^other " "$S1/owner" && grep -q "gives back live slot 1 (other pid=9 " "$LOG" && ! grep -q "reaps orphaned" "$LOG"'
-}
-
-cost_run() {  # cost_run <n> [env...]: external calls of a waiter up to its 4th reaping pass, with <n> tickets ahead
-  local n=$1; shift; fresh; fake_head "$n"; shim "$R/shim" date stat ls sort head basename cat touch sleep mv rm grep sed cut awk mkdir id nproc realpath tail
-  printf '#!/bin/bash\n[ "$1 $2" = "-c %%Y %%n" ] && echo stat-batch >> %q || echo stat >> %q\nexec %q "$@"\n' \
-    "$R/shim/count" "$R/shim/count" "$(command -v stat)" > "$R/shim/stat"
-  env "$@" PATH="$R/shim:$PATH" timeout 30 "$AJS" -C "$R/repo" --load-max 1000 --out "$R/out" -n w -- true > /dev/null 2>&1 & local p=$!
-  until_ 25 "[ \$(grep -c '^stat-batch\$' '$R/shim/count') -ge 4 ]"; kill "$p" 2>/dev/null; wait "$p"
-  awk '$0 == "stat-batch" && ++k == 4 {print NR; f=1; exit} END {if (!f) print 0}' "$R/shim/count"
+  check window-moved-while-live-is-given-back '[ -e "$R/swap.done" ] && [ $rc = 124 ] && grep -q "^other " "$W1/owner" && grep -q "gives back live window 1 (other pid=9 " "$LOG" && ! grep -q "reaps orphaned" "$LOG"'
 }
 
 t_poll_cost() {  # what a waiter launches per pass does not grow with the queue; counted per pass, not per clock
   local n; local -A c
-  for n in 5 25; do c[$n]=$(cost_run "$n" AJS_SLOTS=1); done
+  for n in 5 25; do c[$n]=$(cost_run "$n"); done
   echo "# cost: external calls up to the 4th pass with 5 tickets ${c[5]}, with 25 ${c[25]}"
   check poll-costs-the-same-with-5-or-25-tickets '[ ${c[5]} -gt 0 ] && [ $((${c[25]} - ${c[5]})) -lt 20 ]'
-  for n in 5 25; do c[$n]=$(cost_run "$n" AJS_SLOTS=2); done
-  echo "# cost with two slots: with 5 tickets ${c[5]}, with 25 ${c[25]}"
-  check poll-with-two-slots-costs-the-same-with-5-or-25-tickets '[ ${c[5]} -gt 0 ] && [ $((${c[25]} - ${c[5]})) -lt 20 ]'
+}
+cost_run() {  # cost_run <n>: external calls of a waiter up to its 4th reaping pass, with a live window and <n> live tickets
+  local n=$1 i; fresh; mem_set 5242880 0 0; fake_win 1 $((3 * GIB))
+  for ((i = 1; i <= n; i++)); do : > "$Q/1000$(printf %03d "$i")-1-f$i"; touch -d '+1 min' "$Q/1000$(printf %03d "$i")-1-f$i"; done
+  shim "$R/shim" date stat ls sort head basename cat touch sleep mv rm grep sed cut awk mkdir id realpath tail tr getconf
+  printf '#!/bin/bash\n[ "$1 $2" = "-c %%Y %%n" ] && echo stat-batch >> %q || echo stat >> %q\nexec %q "$@"\n' \
+    "$R/shim/count" "$R/shim/count" "$(command -v stat)" > "$R/shim/stat"
+  PATH="$R/shim:$PATH" timeout 30 "$AJS" -C "$R/repo" --load-max 1000 --out "$R/out" -n w -- true > /dev/null 2>&1 & local p=$!
+  until_ 25 "[ \$(grep -c '^stat-batch\$' '$R/shim/count') -ge 4 ]"; kill "$p" 2>/dev/null; wait "$p"
+  awk '$0 == "stat-batch" && ++k == 4 {print NR; f=1; exit} END {if (!f) print 0}' "$R/shim/count"
 }
 
 t_slow_newcomer() {  # its first stat takes longer than AJS_STALE: the heartbeat already runs
-  fresh; bg h h -- sleep 8; until_ 5 '[ -d "$S1" ]'
+  fresh; mem_set 5242880 0 0; bg h h -- sleep 11; until_ 5 '[ -d "$W1" ]'
   bg w w -- true; until_ 5 '[ "$(tickets)" = 2 ]'
-  mkdir -p "$R/slow"; printf '#!/bin/bash\n[ -e %q ] || { : > %q; sleep 5; }\nexec %q "$@"\n' "$R/slow.done" "$R/slow.done" "$(command -v stat)" > "$R/slow/stat"; chmod +x "$R/slow/stat"
+  mkdir -p "$R/slow"; printf '#!/bin/bash\n[ -e %q ] || { : > %q; sleep 7; }\nexec %q "$@"\n' "$R/slow.done" "$R/slow.done" "$(command -v stat)" > "$R/slow/stat"; chmod +x "$R/slow/stat"
   PATH=$R/slow:$PATH bg n n -- true
-  local x; for x in h w n; do rc_of "$x" 25 > /dev/null; done
+  local x; for x in h w n; do rc_of "$x" 30 > /dev/null; done
   check slow-newcomer-keeps-its-ticket '[ -e "$R/slow.done" ] && [ "$(rcs h w n)" = 000 ] && ! grep -Eqs -- "-n |n lost" "$LOG"'
 }
 
@@ -365,20 +609,28 @@ t_name_with_dead_ticket() {  # a dead ticket with my name does not send me away:
   check dead-ticket-with-my-name-does-not-count '[ $rc = 0 ] && grep -q "reaps dead ticket 1-99-x " "$LOG"'
 }
 
-t_cut_wait_keeps_ownerless_slot() {  # leaving the queue without a slot never removes one, even without owner
-  fresh; mkdir -p "$S1"; touch -d '+1 min' "$S1"
-  swt 3 -n w -- true > /dev/null 2>&1; rc=$?
-  check fresh-slot-without-owner-is-not-reaped '! grep -qs "reaps orphaned" "$LOG"'
-  check cut-wait-does-not-remove-an-ownerless-slot '[ $rc = 124 ] && [ -d "$S1" ] && ! grep -qs "lost slot" "$LOG"'
+t_fresh_window_without_owner_is_left_alone() {  # it is no one's to remove; the newcomer runs beside it
+  fresh; mkdir -p "$W1"; touch -d '+1 min' "$W1"
+  sw -n w -- true > /dev/null 2>&1; rc=$?
+  check fresh-window-without-owner-is-not-reaped '[ $rc = 0 ] && [ -d "$W1" ] && ! grep -qs "reaps orphaned" "$LOG" && noev'
+  mem_set 5242880 0 0
+  sw -n x --timeout 2 -- touch "$R/ran" > /dev/null 2>&1; rc=$?
+  check timed-out-waiter-does-not-remove-an-ownerless-window '[ $rc = 75 ] && [ ! -e "$R/ran" ] && [ -d "$W1" ] && ! grep -qs "lost window" "$LOG"'
 }
 
-t_odd_owner_lines() {  # a stale owner with an empty ticket field, or none, is reaped like any orphan
-  fresh; mkdir -p "$S1"; echo "k pid=5 since=x ticket=" > "$S1/owner"; touch -d '-1 min' "$S1/owner"
+t_window_with_live_ticket_is_kept() {  # a stale owner file whose ticket still beats belongs to a live process
+  fresh; mem_set 5242880 0 0; fake_win 1 $((3 * GIB)); touch -d '-1 min' "$W1/owner"
+  AJS_NOTICE_AFTER=2 swt 5 -n w -- true > /dev/null 2> "$R/w.err"; rc=$?
+  check window-with-live-ticket-is-not-reaped '[ $rc = 124 ] && [ "$(cat "$W1/owner")" = "f1 pid=1 since=x ticket=1000-1-f1" ] && ! grep -qs "reaps" "$LOG"'
+}
+
+t_odd_owner_lines() {  # a stale owner with an empty ticket field is reaped; one with no ticket field is not touched
+  fresh; mem_set 5242880 0 0; mkdir -p "$W1"; echo "k pid=5 since=x ticket=" > "$W1/owner"; touch -d '-1 min' "$W1/owner"
   swt 8 -n w -- true > /dev/null 2>&1; rc=$?
-  check owner-with-empty-ticket-field-is-reaped '[ $rc = 0 ] && grep -q "reaps orphaned slot 1 (k pid=5 since=x ticket=)" "$LOG"'
-  fresh; mkdir -p "$S1"; echo "hand-made lock" > "$S1/owner"; touch -d '-1 min' "$S1/owner"
-  swt 8 -n w -- true > /dev/null 2>&1; rc=$?
-  check owner-without-ticket-field-is-reaped '[ $rc = 0 ] && grep -q "reaps orphaned slot 1 (hand-made lock)" "$LOG"'
+  check owner-with-empty-ticket-field-is-reaped '[ $rc = 0 ] && grep -q "reaps orphaned window 1 (k pid=5 since=x ticket=)" "$LOG"'
+  fresh; mem_set 5242880 0 0; mkdir -p "$W1"; echo "hand-made lock" > "$W1/owner"; touch -d '-1 min' "$W1/owner"
+  swt 4 -n w -- touch "$R/ran" > /dev/null 2>&1; rc=$?
+  check owner-without-ticket-field-is-never-touched '[ $rc = 124 ] && [ ! -e "$R/ran" ] && [ "$(cat "$W1/owner")" = "hand-made lock" ] && ! grep -qs "reaps" "$LOG"'
 }
 
 t_tickets_sort_bytewise_under_any_locale() {  # en_US collation skips '-': ticket order must not depend on it
@@ -392,51 +644,42 @@ t_tickets_sort_bytewise_under_any_locale() {  # en_US collation skips '-': ticke
   check tickets-sort-bytewise-under-any-locale '[ $rc = 73 ] && [ ! -e "$R/ran" ] && grep -qF "$fake" "$R/x.err"'
 }
 
-t_first_given_up_for_dead() {  # its ticket is removed between reading a stale owner and the mv: it does not move it
-  fresh; mkdir -p "$S1"; echo "k pid=5 since=x ticket=1-5-k" > "$S1/owner"; touch -d '-1 min' "$S1/owner"
+t_first_given_up_for_dead() {  # its ticket is removed while it reads a stale owner: it does not reap the window until it is back
+  fresh; mem_set 5242880 0 0; mkdir -p "$W1"; echo "k pid=5 since=x ticket=1-5-k" > "$W1/owner"; touch -d '-1 min' "$W1/owner"
   mkdir -p "$R/st"; cat > "$R/st/stat" <<EOF
 #!/bin/bash
 for a; do :; done
-[ "\$a" = "$S1/owner" ] && [ ! -e "$R/st.done" ] && { : > "$R/st.done"; rm -f "$Q"/*-w; }
+[ "\$a" = "$W1/owner" ] && [ ! -e "$R/st.done" ] && { : > "$R/st.done"; rm -f "$Q"/*-w; }
 exec $(command -v stat) "\$@"
 EOF
   chmod +x "$R/st/stat"
   PATH=$R/st:$PATH sw -n w -- true > /dev/null 2>&1; rc=$?
-  check first-given-up-for-dead-does-not-reap-the-slot '[ -e "$R/st.done" ] && [ $rc = 0 ] && [ "$(grep -o -m1 -e "lost its ticket" -e "reaps orphaned" "$LOG")" = "lost its ticket" ]'
+  check first-given-up-for-dead-does-not-reap-the-window '[ -e "$R/st.done" ] && [ $rc = 0 ] && [ "$(grep -o -m1 -e "lost its ticket" -e "reaps orphaned" "$LOG")" = "lost its ticket" ]'
 }
 
-t_queue_has_no_limit() {  # a ticket with a heartbeat waits its turn beyond --timeout and keeps its place
-  fresh; bg h h -- sleep 6; until_ 5 '[ -d "$S1" ]'
-  bg w w --timeout 2 -- sh -c 'echo w >> "$0"' "$R/order"; queued w
-  bg b b -- sh -c 'echo b >> "$0"' "$R/order"; queued b
-  check queue-has-no-limit '[ "$(rc_of w 30)$(rc_of b 30)$(rc_of h 30)" = 000 ] && [ "$(tr "\n" " " < "$R/order")" = "w b " ]'
+t_machine_stall_removes_nothing() {  # a process stopped for longer than AJS_STALE - 2 x AJS_BEAT sees every beat silent: it waits
+  fresh; mem_set 7340032 0 0
+  bg z z --mem 6 -- sleep 16; until_ 5 '[ -d "$W1" ]'
+  bg w w -- sh -c 'echo w >> "$0"' "$R/order"; queued w; sleep 1
+  wp=$(pid_of w); kill -STOP "$wp"; : > "$Q/1000-9-dead"; touch -d '-1 min' "$Q/1000-9-dead"; sleep 4; kill -CONT "$wp"
+  until_ 8 'grep -q "machine stall" "$LOG" 2>/dev/null'; stalled=$?; [ -e "$Q/1000-9-dead" ] && kept=yes || kept=no
+  check stall-is-said-and-nothing-is-removed-at-once '[ $stalled = 0 ] && [ "$kept" = yes ] && grep -Eq "w machine stall: this process was [0-9]+ s without running; not removing tickets or windows until 5 s later" "$LOG"'
+  check dead-ticket-goes-after-the-grace '[ "$(until_ 15 "[ ! -e \"$Q/1000-9-dead\" ]"; echo $?)" = 0 ] && grep -q "reaps dead ticket 1000-9-dead " "$LOG"'
+  for n in z w; do rc_of "$n" 30 > /dev/null; done
 }
 
-t_gate_counts_from_arrival() {  # --timeout measures the gate from when the slot reaches it, not from the queue
-  # Gate polls at G, G+6 and G+12; load drops at G+8: an 8 s limit from G holds, one from the queue (>= 6 s earlier) would not.
-  fresh; bg h h -- sh -c 'touch "$0"; sleep 6' "$R/h.go"; until_ 10 '[ -e "$R/h.go" ]'
-  load_set 9.00; bg w w --load-max 4 --timeout 8 -- true; until_ 20 '[ -e "$S1/gate" ]'; sleep 8; load_set 0.50
-  check gate-timeout-counts-from-arrival '[ "$(rc_of w 20)" = 0 ]'
-  rc_of h > /dev/null
+t_foreign_window_at_release() {  # if the window is no longer mine when done, I do not remove it, and I do not log a peak
+  fresh; bg h h -- sleep 3; until_ 5 '[ -s "$W1/owner" ]'
+  rm -rf "$W1"; mkdir "$W1"; echo "other pid=9 since=x ticket=1-9-other" > "$W1/owner"; echo 123456789 > "$W1/peak"
+  check foreign-window-survives-release '[ "$(rc_of h 10)" = 0 ] && grep -q "^other " "$W1/owner"'
+  check lost-window-warns-of-overlap-and-logs-no-peak 'grep -q "lost window 1 while running" "$R/h.err" && grep -q "h lost window 1 while running" "$LOG" && ! grep -q " h peak " "$LOG"'
 }
 
-t_notice_names_the_ticket() {  # after AJS_NOTICE_AFTER, the exact rm that frees a dead owner's slot
-  fresh; bg h h -- sleep 8; until_ 5 '[ -d "$S1" ]'; th=$(ls "$Q")
-  AJS_NOTICE_AFTER=2 swt 5 -n w -- true > /dev/null 2> "$R/w.err"; rc=$?
-  check notice-names-the-owner-ticket '[ $rc = 124 ] && grep -qF "rm -rf '\''$S1'\'' '\''$Q/$th'\''" "$R/w.err"'
-  rc_of h > /dev/null
-}
-
-t_foreign_slot_at_release() {  # if the slot is no longer mine when done, I do not remove it
-  fresh; bg h h -- sleep 2; until_ 5 '[ -s "$S1/owner" ]'
-  rm -rf "$S1"; mkdir "$S1"; echo "other pid=9 since=x ticket=1-9-other" > "$S1/owner"
-  check foreign-slot-survives-release '[ "$(rc_of h 10)" = 0 ] && grep -q "^other " "$S1/owner"'
-  check lost-slot-warns-of-overlap 'grep -q "lost slot 1 while running" "$R/h.err" && grep -q "h lost slot 1 while running" "$LOG"'
-}
+# ---- the command: workers, logs, the safety clock ----------------------------------------------------------------------------------
 
 fake_runners() {  # <dir>/{jest,vitest,npx,pnpm,vitest-part.sh}: print their args; the wrapper sets its own workers
   local d=$1 c; mkdir -p "$d"
-  for c in jest vitest; do printf '#!/bin/bash\necho "args: $*"\necho "Tests: 1 passed, 1 total"\n' > "$d/$c"; done
+  for c in jest vitest; do printf '#!/bin/bash\necho "args: $*"\necho "Tests: 1 passed, 1 total"\nsleep 1\n' > "$d/$c"; done
   printf '#!/bin/bash\nwhile [[ ${1:-} == -* ]]; do shift; done\nexec "$@"\n' > "$d/npx"
   printf '#!/bin/bash\n[ "$1" = exec ] && shift\nexec "$@"\n' > "$d/pnpm"
   printf '#!/bin/bash\nexec "%s/vitest" --maxWorkers=1 "$@"\n' "$d" > "$d/vitest-part.sh"
@@ -467,157 +710,80 @@ t_same_second_logs_do_not_clash() {  # a date frozen in one second: the pid in t
   check same-second-second-does-not-overwrite-first '[ "$(head -n1 "$l1")" = one ] && [ "$(head -n1 "$l2")" = two ] && [ "$(ls "$R/out" | wc -l)" = 2 ]'
 }
 
-t_two_slots_by_default() {  # without AJS_SLOTS: two at once; the third starts when one leaves
-  fresh; unset AJS_SLOTS
-  for n in a b c; do bg "$n" "$n" -- sh -c "$EV" "$R/ev" "$n" 3; queued "$n"; done
-  for n in a b c; do rc_of "$n" 30 > /dev/null; done
-  check two-slots-run-together-by-default '[ "$(rcs a b c)" = 000 ] && overlap a b'
-  check third-waits-for-a-free-slot '[ "$(max_conc)" = 2 ] && [ "$(ev_at + c)" -ge "$(first_end a b)" ] && [ ! -e "$S1" ] && [ ! -e "$S2" ] && [ -z "$(ls -A "$Q")" ] && [ ! -e "$LOG" ]'
+t_max_runtime_ends_a_hung_command() {  # the safety clock: TERM to the tree, KILL after 10 s, rc 124
+  fresh
+  t0=$SECONDS; sw -n t --max-runtime 2 -- sh -c 'echo $$ > "$0"; exec sleep 60' "$R/t.pid" > "$R/t.out" 2> "$R/t.err"; rc=$?; el=$((SECONDS - t0))
+  check max-runtime-ends-the-command-with-rc124 '[ $rc = 124 ] && [ $el -lt 9 ] && ! kill -0 "$(cat "$R/t.pid")" 2>/dev/null && grep -Eq "expired: --max-runtime 2 s; TERM to the command.s tree and KILL after 10 s \(the command left with 1[34][0-9]\) \(output: " "$R/t.out" && [ "$(wins)" = 0 ] && [ -z "$(ls -A "$Q")" ]'
+  t0=$SECONDS; sw -n u --max-runtime 2 -- sh -c 'trap "" TERM; echo $$ > "$0"; i=0; while [ $i -lt 40 ]; do sleep 1; i=$((i + 1)); done' "$R/u.pid" > "$R/u.out" 2> /dev/null; rc=$?; el=$((SECONDS - t0))
+  check max-runtime-kills-what-ignores-term-after-the-grace '[ $rc = 124 ] && [ $el -ge 11 ] && [ $el -lt 20 ] && ! kill -0 "$(cat "$R/u.pid")" 2>/dev/null'
+  sw -n v --max-runtime 30 -- sh -c 'echo "Tests: 1 passed, 1 total"' > "$R/v.out"; rc=$?
+  check max-runtime-does-not-touch-a-command-that-ends '[ $rc = 0 ] && ! grep -q expired "$R/v.out"'
 }
 
-t_two_slots_fifo_with_a_slow_poller() {  # the freed slot goes to the oldest ticket even if it polls every 7 s
-  fresh; export AJS_SLOTS=2; acq_shim
-  bg z1 z1 -- sleep 6; until_ 5 '[ -d "$S1" ]'
-  bg z2 z2 -- sleep 2; until_ 5 '[ -d "$S2" ]'
-  AJS_POLL=7 bg a a -- sh -c "$EV" "$R/ev" a 1; queued a
-  bg b b -- sh -c "$EV" "$R/ev" b 1; queued b
-  for n in z1 z2 a b; do rc_of "$n" 30 > /dev/null; done
-  check two-slots-fifo-free-slot-goes-to-the-oldest '[ "$(rcs z1 z2 a b)" = 0000 ] && [ "$(acq_order)" = "z1 z2 a b " ]'
+helpers_of() {  # helpers_of <pid>: the descendants of <pid> that run the script itself (heartbeat, watcher, clock), one per line
+  local want p; want=$(tr '\0' ' ' < "/proc/$1/cmdline")
+  ps -e -o pid=,ppid= | awk -v r="$1" '{ k[$2] = k[$2] " " $1 } END { q[1] = r; h = 1; t = 1
+    while (h <= t) { n = split(k[q[h++]], c, " "); for (i = 1; i <= n; i++) { q[++t] = c[i]; print c[i] } } }' |
+    while read -r p; do [ "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" = "$want" ] && echo "$p"; done
+}
+t_max_runtime_clock_dies_with_its_owner() {  # owner SIGKILLed: its clock leaves without signalling anything
+  fresh
+  bg a a --max-runtime 40 -- sh -c 'exec sleep 12.1'; bg b b --max-runtime 12 -- sh -c 'exec sleep 59.2'
+  until_ 8 '[ -s "$W1/owner" ] && [ -s "$W2/owner" ]'; sleep 1
+  pa=$(pid_of a); pb=$(pid_of b); ha=$(helpers_of "$pa" | tr '\n' ' ')
+  kill -9 "$pa" "$pb"; sleep 16
+  gone=1; for p in $ha; do kill -0 "$p" 2>/dev/null && gone=0; done
+  check max-runtime-clock-leaves-with-its-owner '[ -n "$ha" ] && [ $gone = 1 ]'
+  check max-runtime-clock-of-a-dead-owner-signals-nothing 'pgrep -xf "sleep 59.2" > /dev/null'
+  pkill -xf "sleep 59.2" 2>/dev/null; true
 }
 
-t_dead_slot_two_is_reaped() {  # SIGKILL to the owner of slot 2: its ticket and slot are reaped and the next enters
-  fresh; export AJS_SLOTS=2
-  bg z z -- sh -c "$EV" "$R/ev" z 12; until_ 5 'started z'
-  bg k k -- sh -c 'echo $$ > "$0"; exec sleep 60' "$R/k.child"; until_ 5 '[ -s "$R/k.child" ] && [ -d "$S2" ]'
-  bg w w -- sh -c "$EV" "$R/ev" w 0; until_ 5 '[ "$(tickets)" = 3 ]'
-  kp=$(pid_of k); kill -9 "$kp"; kill -9 "$(cat "$R/k.child")"
-  rc_of w 20 > /dev/null; rc_of z 20 > /dev/null
-  check dead-slot-is-reaped-and-the-next-enters '[ "$(rcs w z)" = 00 ] && [ "$(ev_at + w)" -lt "$(ev_at - z)" ] && grep -Eq "reaps dead ticket [0-9]+-$kp-k " "$LOG" && grep -q "reaps orphaned slot 2 (k pid=$kp " "$LOG" && [ ! -e "$S2" ]'
-}
+# ---- containment: a window that runs away dies alone -----------------------------------------------------------------------------
 
-t_slot_with_live_ticket_is_kept() {  # a stale owner file whose ticket still beats belongs to a live process
-  fresh; export AJS_SLOTS=2; mkdir -p "$Q" "$S1" "$S2"
-  echo "f1 pid=1 since=x ticket=1000-1-f1" > "$S1/owner"; touch -d '+1 min' "$S1/owner" "$Q/1000-1-f1"
-  echo "f2 pid=2 since=x ticket=1001-2-f2" > "$S2/owner"; touch -d '-1 min' "$S2/owner"; touch -d '+1 min' "$Q/1001-2-f2"
-  AJS_NOTICE_AFTER=2 swt 5 -n w -- true > /dev/null 2> "$R/w.err"; rc=$?
-  check slot-with-live-ticket-is-not-reaped '[ $rc = 124 ] && [ "$(cat "$S2/owner")" = "f2 pid=2 since=x ticket=1001-2-f2" ] && ! grep -qs "reaps orphaned" "$LOG"'
-  check notice-names-each-slot-and-its-ticket 'grep -qF "waiting for a slot held by slot.1: f1 pid=1 since=x ticket=1000-1-f1; slot.2: f2 pid=2 since=x ticket=1001-2-f2 for " "$R/w.err" && grep -qF "rm -rf '\''$S1'\'' '\''$Q/1000-1-f1'\'' '\''$S2'\'' '\''$Q/1001-2-f2'\''  (queue: " "$R/w.err"'
+real_contain() { command -v prlimit > /dev/null && unshare --user --map-current-user --pid --fork --kill-child --mount-proc -- /bin/true 2> /dev/null; }
+contain_shims() {  # stand-ins for unshare and prlimit: they run the command as a child, so the watcher reads its tree as it would in a namespace
+  mkdir -p "$R/cshim"
+  cat > "$R/cshim/unshare" <<'EOF'
+#!/bin/bash
+while [ "${1:-}" != -- ] && [ $# -gt 0 ]; do shift; done; shift
+"$@"; exit $?
+EOF
+  cat > "$R/cshim/prlimit" <<'EOF'
+#!/bin/bash
+while [ "${1:-}" != -- ] && [ $# -gt 0 ]; do shift; done; shift
+exec "$@"
+EOF
+  chmod +x "$R/cshim/unshare" "$R/cshim/prlimit"
 }
-
-t_slot_two_ticket_removed_stays() {  # slot 2's heartbeat is its owner file: without a ticket its live owner stays
-  fresh; export AJS_SLOTS=2
-  bg z z -- sleep 10; until_ 5 '[ -d "$S1" ]'
-  bg h h -- sh -c 'sleep 6; echo h-end >> "$0"' "$R/order"; until_ 5 '[ -d "$S2" ]'
-  bg w w -- sh -c 'echo w >> "$0"' "$R/order"; until_ 5 '[ "$(tickets)" = 3 ]'
-  rm -f "$Q"/*-h
-  for n in h w z; do rc_of "$n" 25 > /dev/null; done
-  check slot-two-without-ticket-keeps-its-owner '[ "$(rcs h w z)" = 000 ] && [ "$(tr "\n" " " < "$R/order")" = "h-end w " ] && ! grep -qs slot "$LOG"'
+contain_checks() {  # contain_checks <label> <orphans>: memory and task limits kill the window that passes them, not the others
+  local label=$1 orphans=$2   # a stand-in leaves the command's orphans behind, and their pid is real; in a namespace they die with it
+  AJS_KILL_MEM_MIB=64 sw -n m -- perl -e 'open F, ">", $ARGV[0]; print F $$; close F; $x = "a" x 150_000_000; sleep 12' "$R/m.pid" > "$R/m.out" 2> "$R/m.err"; rc=$?
+  [ "$orphans" = yes ] && [ -s "$R/m.pid" ] && kill -9 "$(cat "$R/m.pid")" 2>/dev/null
+  check "$label-memory-past-the-limit-kills-the-window" '[ $rc = 137 ] && grep -Eq " contained: RSS [0-9]+ MiB >= 64 MiB (\(output: |$)" "$R/m.out" && grep -q "contained: RSS" "$(raw_of "$R/m.out")" && [ "$(wins)" = 0 ]'
+  AJS_TASKS_MAX=20 sw -n k -- sh -c 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do sleep 9 & done; wait' > "$R/k.out" 2> /dev/null; rc=$?
+  check "$label-tasks-at-90-percent-kill-the-window" '[ $rc = 137 ] && grep -Eq " contained: tasks [0-9]+ >= 18 \(90 % of its cap 20\)" "$R/k.out"'
+  bg z z --mem 0.2 -- sleep 5; until_ 5 '[ -d "$W1" ]'
+  AJS_KILL_MEM_MIB=64 sw -n m2 -- perl -e 'open F, ">", $ARGV[0]; print F $$; close F; $x = "a" x 150_000_000; sleep 12' "$R/m2.pid" > /dev/null 2>&1
+  [ "$orphans" = yes ] && [ -s "$R/m2.pid" ] && kill -9 "$(cat "$R/m2.pid")" 2>/dev/null
+  check "$label-only-the-runaway-window-dies" '[ "$(rc_of z 15)" = 0 ]'
+  sw -n ok --mem 0.2 -- sh -c 'echo "Tests: 1 passed, 1 total"; sleep 1' > "$R/ok.out"; rc=$?
+  check "$label-a-sane-command-is-not-touched" '[ $rc = 0 ] && ! grep -q contained "$R/ok.out"'
 }
-
-t_fewer_slots_session_sees_every_slot() {  # a session with AJS_SLOTS=1 still counts a holder of slot 2 as served
-  fresh; mkdir -p "$Q" "$S2"
-  echo "f pid=1 since=x ticket=1000-1-f" > "$S2/owner"; touch -d '+1 min' "$S2/owner" "$Q/1000-1-f"
-  AJS_SLOTS=1 swt 8 -n w -- true > /dev/null 2>&1; rc=$?
-  check fewer-slots-session-sees-every-slot '[ $rc = 0 ] && [ -d "$S2" ] && [ ! -e "$S1" ]'
+t_containment_with_a_stand_in() {  # the watcher's decisions, whether or not this machine allows namespaces
+  fresh; contain_shims
+  PATH="$R/cshim:$PATH" contain_checks stand-in yes
 }
-
-t_memory_gate_per_slot() {  # alone it never waits for memory; the second waits for RAM, for swap when RAM is low, and for PSI
-  fresh; export AJS_SLOTS=2; mem_set 1048576 0 0; psi_set 50.00
-  sw -n solo -- sh -c "$EV" "$R/ev" solo 0 > /dev/null 2>&1; rc=$?
-  check memory-gate-never-stops-the-first '[ $rc = 0 ] && started solo'
-  psi_set 0.00; bg z z -- sh -c "$EV" "$R/ev" z 26; until_ 5 'started z'
-  bg w w -- sh -c "$EV" "$R/ev" w 0; until_ 5 '[ -e "$S2/gate" ]'
-  sleep 3; started w && low=no || low=yes
-  mem_set 6291456 8388608 1048576; sleep 7; started w && swap=no || swap=yes
-  mem_set 16777216 8388608 8388608; psi_set 25.00; sleep 7; started w && psi=no || psi=yes
-  mem_set 16777216 8388608 1048576; psi_set 9.99; rc_of w 20 > /dev/null; rc_of z 35 > /dev/null
-  check memory-gate-stops-the-second '[ "$low" = yes ]'
-  check swap-gate-stops-the-second '[ "$swap" = yes ]'
-  check psi-gate-stops-the-second '[ "$psi" = yes ]'
-  check memory-gate-opens-when-there-is-room '[ "$(rcs w z)" = 00 ] && [ "$(ev_at + w)" -lt "$(ev_at - z)" ] && [ ! -e "$S2" ]'
-  check used-swap-with-roomy-ram-does-not-stop '[ "$(rcs w z)" = 00 ] && [ "$(ev_at + w)" -lt "$(ev_at - z)" ]'
+t_containment_with_namespaces() {
+  fresh
+  real_contain || { skip containment-with-namespaces 'unshare of user and pid namespaces (and prlimit) does not work here'; return; }
+  contain_checks namespace no
+  sw -n ns -- sh -c 'echo "pid inside: $$"' > "$R/ns.out"
+  check namespace-command-is-pid-1-ish '[ "$(sed -n "s/^pid inside: //p" "$(raw_of "$R/ns.out")")" -lt 10 ] && ! grep -q uncontained "$R/ns.out"'
 }
-
-t_memory_timeout_names_the_measure() {
-  fresh; export AJS_SLOTS=2; mem_set 1048576 0 0
-  bg z z -- sleep 9; until_ 5 '[ -d "$S1" ]'
-  sw -n x --timeout 2 -- true > /dev/null 2> "$R/x.err"; rc=$?
-  check memory-timeout-rc75-with-the-measure '[ $rc = 75 ] && grep -qF "agent-job-semaphore: no memory for another slot (MemAvailable 1024 MiB, minimum 4096; SwapFree 0 MiB, reserve 0 below 8192; PSI some avg10 0.00, maximum 10) after" "$R/x.err" && [ ! -e "$S2" ]'
-  rc_of z 15 > /dev/null
-}
-
-t_memory_thresholds_are_configurable() {
-  fresh; export AJS_SLOTS=2; mem_set 1048576 0 0
-  bg z z -- sleep 15; until_ 5 '[ -d "$S1" ]'
-  AJS_MEM_MIN_MIB=512 sw -n x --timeout 2 -- true > /dev/null 2>&1; rc=$?
-  check memory-minimum-is-configurable '[ $rc = 0 ]'
-  mem_set 16777216 8388608 8388608; psi_set 5.00
-  AJS_PSI_MAX=3 sw -n y --timeout 2 -- true > /dev/null 2> "$R/y.err"; rc=$?
-  check psi-maximum-is-configurable '[ $rc = 75 ] && grep -qF "PSI some avg10 5.00, maximum 3" "$R/y.err"'
-  rc_of z 25 > /dev/null
-}
-
-t_two_at_their_gates_do_not_deadlock() {  # a slot waiting at its gate counts only for later arrivals
-  fresh; export AJS_SLOTS=2; mem_set 1048576 0 0; load_set 50.00
-  bg a a --load-max 4 --timeout 25 -- sh -c "$EV" "$R/ev" a 2; until_ 5 '[ -e "$S1/gate" ]'
-  bg b b --load-max 4 --timeout 25 -- sh -c "$EV" "$R/ev" b 0; until_ 5 '[ -e "$S2/gate" ]'
-  load_set 1.00
-  rc_of a 30 > /dev/null; rc_of b 30 > /dev/null
-  check two-at-their-gates-do-not-deadlock '[ "$(rcs a b)" = 00 ]'
-  check second-waits-for-memory-while-the-first-runs '[ "$(ev_at + b)" -ge "$(ev_at - a)" ]'
-}
-
-t_foreign_load_counts_only_running_slots() {  # outside load between one and two budgets, nothing running: nobody starts
-  fresh; export AJS_SLOTS=2; acq_shim; load_set 5.00
-  # The first polls its gate every 15 s and the second every 6: without the line at the gate, the second would pass first.
-  AJS_GATE_POLL=15 bg a a --load-max 4 -- sh -c "$EV" "$R/ev" a 3; until_ 5 '[ -e "$S1/gate" ]'
-  bg b b --load-max 4 -- sh -c "$EV" "$R/ev" b 0; until_ 5 '[ -e "$S2/gate" ]'
-  sleep 3; started a || started b && nobody=no || nobody=yes
-  low=$(date +%s%N); load_set 1.00
-  rc_of a 40 > /dev/null; rc_of b 40 > /dev/null
-  check foreign-load-with-two-slots-and-none-running-nobody-starts '[ "$nobody" = yes ]'
-  check foreign-load-drops-and-they-start-in-queue-order '[ "$(rcs a b)" = 00 ] && [ "$(acq_order)" = "a b " ] && [ "$(ev_at + a)" -gt "$low" ] && [ "$(ev_at + a)" -lt "$(ev_at + b)" ]'
-}
-
-t_dead_at_its_gate() {  # silent while at its gate: it neither loads the machine nor holds back later ones
-  fresh; export AJS_SLOTS=2; mkdir -p "$Q" "$S1"; : > "$S1/gate"
-  echo "m pid=1 since=x ticket=1000-1-m" > "$S1/owner"; touch -d '-1 min' "$S1/owner" "$S1/gate" "$S1"; load_set 5.00
-  bg w w --load-max 4 --timeout 15 -- sh -c "$EV" "$R/ev" w 0; until_ 5 '[ -e "$S2/gate" ]'
-  sleep 3; started w && load=no || load=yes
-  load_set 1.00; rc_of w 25 > /dev/null
-  check dead-at-its-gate-does-not-count-for-load '[ "$load" = yes ]'
-  check dead-at-its-gate-does-not-hold-back-the-next '[ "$(rcs w)" = 0 ] && started w'
-}
-
-t_slot_marks_its_gate_before_its_owner() {  # whoever reads a freshly taken slot's owner already sees its gate
-  fresh; export AJS_SLOTS=2; load_set 5.00
-  sed -E 's/(> "\$slot\/owner")$/\1; sleep 4/' "$AJS" > "$R/owner-slow" && chmod +x "$R/owner-slow" &&
-    grep -q '> "$slot/owner"; sleep 4$' "$R/owner-slow" || { ko gate-before-owner-instrument 'no slow-owner copy'; return; }
-  AJS_OVERRIDE=$R/owner-slow bg a a --load-max 4 --timeout 20 -- sh -c "$EV" "$R/ev" a 0; until_ 5 '[ -s "$S1/owner" ]'
-  bg b b --load-max 4 --timeout 20 -- sh -c "$EV" "$R/ev" b 0; until_ 5 '[ -e "$S2/gate" ]'
-  sleep 2; started b && early=yes || early=no
-  load_set 1.00; rc_of a 30 > /dev/null; rc_of b 30 > /dev/null
-  check slot-at-its-gate-does-not-look-running-after-its-owner '[ "$early" = no ] && [ "$(rcs a b)" = 00 ]'
-}
-
-t_load_per_slot() {  # alone, load1 < budget; with another slot running, < budget per busy slot
-  fresh; export AJS_SLOTS=2; load_set 6.00
-  sw -n x --load-max 4 --timeout 2 -- true > /dev/null 2> "$R/x.err"; rc=$?
-  check load-with-one-slot-uses-one-budget '[ $rc = 75 ] && grep -qF "agent-job-semaphore: load1 6.00 >= 4 after" "$R/x.err"'
-  load_set 1.00; bg z z --load-max 4 -- sh -c "$EV" "$R/ev" z 22; until_ 5 'started z'
-  load_set 6.00; sw -n w --load-max 4 -- sh -c "$EV" "$R/ev" w 0 > /dev/null 2>&1; rc=$?
-  check load-per-slot-lets-the-second-in '[ $rc = 0 ] && started w && ! grep -q "^- z " "$R/ev"'
-  load_set 9.00; sw -n y --load-max 4 --timeout 2 -- true > /dev/null 2> "$R/y.err"; rc=$?
-  check load-per-slot-stops-above-two-budgets '[ $rc = 75 ] && grep -qF "agent-job-semaphore: load1 9.00 >= 8 (4 per slot, 2 slots) after" "$R/y.err"'
-  load_set 1.00; sw -n v --load-max 0.5 --timeout 2 -- true > /dev/null 2> "$R/v.err"; rc=$?
-  check fractional-load-budget '[ $rc = 75 ] && grep -qF "load1 1.00 >= 1 (0.50 per slot, 2 slots) after" "$R/v.err"'
-  rc_of z 30 > /dev/null
-}
-
-t_unreadable_loadavg_holds_the_gate() {  # a load that cannot be read never counts as low
-  fresh; export AJS_LOADAVG_FILE=$R/missing
-  sw -n x --timeout 1 -- touch "$R/ran" > /dev/null 2> "$R/x.err"; rc=$?
-  check unreadable-loadavg-holds-the-gate '[ $rc = 75 ] && [ ! -e "$R/ran" ] && grep -qF "load1 ? >= 1000 after" "$R/x.err"'
+t_uncontained_says_so() {
+  fresh; mkdir -p "$R/nonamespace"; printf '#!/bin/sh\nexit 1\n' > "$R/nonamespace/unshare"; chmod +x "$R/nonamespace/unshare"
+  PATH="$R/nonamespace:$PATH" sw -n u -- sh -c 'echo "Tests: 1 passed, 1 total"' > "$R/u.out"; rc=$?
+  check without-namespaces-the-line-says-uncontained '[ $rc = 0 ] && grep -Eq "Tests: 1 passed, 1 total uncontained \(output: " "$R/u.out"'
 }
 
 for t in $(declare -F | awk '$3 ~ /^t_/ {print $3}'); do
